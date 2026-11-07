@@ -2,6 +2,7 @@
 const SETUP_MODEL = "gemini-3.5-flash-lite" as const;
 const REQUEST_TIMEOUT_MS = 10_000;
 const LOGOUT_UNCONFIRMED = "目前無法確認登出結果，請手動重試登出。";
+const MAX_KNOWLEDGE_QUERY_CODE_POINTS = 2_000;
 const setupStatuses = [
   "unconfigured",
   "unverified",
@@ -23,6 +24,20 @@ interface IdentityDto {
   readonly username: Role;
   readonly role: Role;
 }
+
+interface KnowledgeSearchResult {
+  readonly document_id: string;
+  readonly title: string;
+  readonly version: string;
+  readonly fragment_id: string;
+  readonly excerpt: string;
+}
+
+interface KnowledgeSearchDto {
+  readonly results: readonly KnowledgeSearchResult[];
+}
+
+type KnowledgeSearchState = "idle" | "loading" | "success" | "empty" | "error";
 
 interface Operation {
   readonly controller: AbortController;
@@ -52,17 +67,28 @@ const logoutPending = ref(false);
 let foregroundEpoch = 0;
 let lastForegroundCheckEpoch: number | null = null;
 let foregroundCheckRequested = false;
+let setupReadSequence = 0;
 const identity = ref<IdentityDto | null>(null);
 const username = ref("");
 const password = ref("");
+const knowledgeQuery = ref("");
+const knowledgeQueryError = ref("");
+const knowledgeSearchError = ref("");
+const knowledgeSearchState = ref<KnowledgeSearchState>("idle");
+const knowledgeResults = ref<KnowledgeSearchResult[]>([]);
 const usernameInput = ref<HTMLInputElement | null>(null);
 const passwordInput = ref<HTMLInputElement | null>(null);
+const knowledgeQueryInput = ref<HTMLInputElement | null>(null);
+const knowledgeResultsHeading = ref<HTMLElement | null>(null);
+const knowledgeSearchErrorHeading = ref<HTMLElement | null>(null);
 const setupStatusHeading = ref<HTMLElement | null>(null);
 const setupErrorHeading = ref<HTMLElement | null>(null);
 const setupLogoutFeedback = ref<HTMLElement | null>(null);
 const authFeedbackHeading = ref<HTMLElement | null>(null);
 const workbenchHeading = ref<HTMLElement | null>(null);
 const loginFeedbackHeading = ref<HTMLElement | null>(null);
+let knowledgeSearchController: AbortController | null = null;
+let knowledgeSetupReadback: Operation | null = null;
 
 // 認證忙碌狀態直接由唯一操作推導，避免維護重複旗標。
 const isAuthBusy = computed(() => activeOperation.value !== null);
@@ -91,13 +117,6 @@ const roleDescription = computed(() =>
     ? "此為您專屬的一般使用者工作區。"
     : "此工作區確認為客服角色，與一般使用者的個人工作區分開。",
 );
-// 空狀態依角色使用不同文案，清楚表示目前沒有業務項目。
-const emptyStateDescription = computed(() =>
-  identity.value?.role === "user"
-    ? "目前沒有可顯示的個人服務項目。此版本先提供登入狀態與角色識別。"
-    : "目前沒有可顯示的客服處理項目。此版本先提供登入狀態與客服角色識別。",
-);
-
 // 僅接受完整且符合固定模型契約的狀態回應，未知內容不得開放登入。
 function isSetupDto(value: unknown): value is SetupDto {
   // 先拒絕非物件與陣列，再安全檢查物件欄位。
@@ -159,6 +178,58 @@ function isIdentityDto(value: unknown): value is IdentityDto {
     dto.username === dto.role &&
     (dto.role === "user" || dto.role === "support")
   );
+}
+
+// 僅接受最多二十筆完整純文字片段，避免錯誤回應進入工作台。
+function isKnowledgeSearchDto(value: unknown): value is KnowledgeSearchDto {
+  // 先拒絕非物件與陣列，再安全檢查搜尋回應欄位。
+  // prettier-ignore
+  if (
+    typeof value !== "object"
+    || value === null
+    || Array.isArray(value)
+  ) {
+    return false;
+  }
+
+  const dto = value as Record<string, unknown>;
+
+  // 外層只接受最多二十筆 results，避免錯誤回應進入工作台。
+  // prettier-ignore
+  if (
+    Object.keys(dto).length !== 1
+    || !("results" in dto)
+    || !Array.isArray(dto.results)
+    || dto.results.length > 20
+  ) {
+    return false;
+  }
+
+  // 逐筆拒絕非物件、額外欄位或非文字片段。
+  return dto.results.every((item) => {
+    // 先拒絕陣列與 null，再檢查結果欄位。
+    // prettier-ignore
+    if (
+      typeof item !== "object"
+      || item === null
+      || Array.isArray(item)
+    ) {
+      return false;
+    }
+
+    const result = item as Record<string, unknown>;
+
+    // 每筆只接受 API 定義的五個純文字欄位。
+    // prettier-ignore
+    return (
+      Object.keys(result).length === 5
+      && typeof result.document_id === "string"
+      && typeof result.title === "string"
+      && typeof result.version === "string"
+      && typeof result.fragment_id === "string"
+      && typeof result.excerpt === "string"
+    );
+  });
 }
 
 // 只讀取安全狀態與限流標頭，不顯示伺服器錯誤本文或診斷內容。
@@ -288,6 +359,9 @@ async function recheckSetup(
     isLoading.value = true;
   }
 
+  // 較晚開始的 setup 讀取優先，舊回應不得覆蓋新的啟用判斷。
+  const readSequence = ++setupReadSequence;
+
   // 啟用狀態只讀一次；失敗交由使用者手動恢復。
   const result = await requestApi("/api/setup", operation, { method: "GET" });
   if (activeOperation.value !== operation) {
@@ -295,6 +369,10 @@ async function recheckSetup(
   }
   // 離開前景前開始的查詢已過期，即使回應有效也不能更新畫面。
   if (isForegroundCheck && operation.foregroundEpoch !== foregroundEpoch) {
+    return "stale";
+  }
+  // 搜尋自己的安全回讀若更新得較晚，舊前景結果不再寫入共享狀態。
+  if (readSequence !== setupReadSequence) {
     return "stale";
   }
   isLoading.value = false;
@@ -586,6 +664,194 @@ async function submitLogin(): Promise<void> {
   });
 }
 
+// 取消舊查詢並清除其結果，避免失效回應或片段跨身分留存。
+function cancelKnowledgeSearch(): void {
+  // 先撤銷目前控制器，再中止傳輸，讓遲到回應無法更新畫面。
+  const controller = knowledgeSearchController;
+  knowledgeSearchController = null;
+  controller?.abort();
+
+  // 清除與舊查詢相關的畫面狀態，保留使用者正在編輯的關鍵字。
+  knowledgeSearchState.value = "idle";
+  knowledgeSearchError.value = "";
+  knowledgeQueryError.value = "";
+  knowledgeResults.value = [];
+}
+
+// 只有同一身分與啟用狀態仍有效時，才允許查詢結果更新工作台。
+function isCurrentKnowledgeSearch(
+  operation: Operation,
+  owner: IdentityDto,
+): boolean {
+  // 同時檢查控制器、取消權、服務狀態與登入物件擁有權。
+  // prettier-ignore
+  return (
+    knowledgeSearchController === operation.controller
+    && !operation.controller.signal.aborted
+    && isServiceReady.value
+    && identity.value === owner
+  );
+}
+
+// 修改關鍵字時中止舊查詢並移除不再對應的結果與錯誤。
+function handleKnowledgeQueryInput(): void {
+  // 輸入變更代表目前結果已不再符合表單內容。
+  cancelKnowledgeSearch();
+}
+
+// 搜尋已匯入知識片段，使用獨立取消權，不佔用登入或登出的操作鎖。
+async function submitKnowledgeSearch(): Promise<void> {
+  // 僅允許 ready 且已登入的角色使用工作台搜尋。
+  const owner = identity.value;
+  if (!isServiceReady.value || !owner) {
+    return;
+  }
+
+  // 空白查詢明確要求修正，不依賴 required 接受空格的瀏覽器行為。
+  const query = knowledgeQuery.value;
+  if (!query.trim()) {
+    cancelKnowledgeSearch();
+    knowledgeQueryError.value = "請輸入搜尋關鍵字。";
+    focus(knowledgeQueryInput);
+    return;
+  }
+
+  // 以 Unicode code points 計數，超限時拒絕而不截斷 UTF-16 輸入。
+  if (Array.from(query).length > MAX_KNOWLEDGE_QUERY_CODE_POINTS) {
+    cancelKnowledgeSearch();
+    knowledgeQueryError.value = "搜尋關鍵字不可超過 2,000 個 Unicode 字元。";
+    focus(knowledgeQueryInput);
+    return;
+  }
+
+  // 新送出會先撤銷舊查詢，並清除與前次關鍵字相關的畫面內容。
+  cancelKnowledgeSearch();
+  const operation: Operation = {
+    controller: new AbortController(),
+    foregroundEpoch: null,
+  };
+  knowledgeSearchController = operation.controller;
+  knowledgeSearchState.value = "loading";
+
+  try {
+    // 查詢只送原始關鍵字與 CSRF 標頭，同源 fetch 不會自動重送。
+    const result = await requestApi("/api/knowledge/search", operation, {
+      method: "POST",
+      body: { query },
+      headers: { "X-CSRF-Protection": "1" },
+    });
+    if (!isCurrentKnowledgeSearch(operation, owner)) {
+      return;
+    }
+
+    // 只有完整且合法的 200 回應可以顯示片段，查無資料仍是有效結果。
+    if (result.status === 200) {
+      if (!isKnowledgeSearchDto(result.data)) {
+        knowledgeSearchError.value = "搜尋回應格式無法確認，請稍後手動重試。";
+        knowledgeSearchState.value = "error";
+        focus(knowledgeSearchErrorHeading);
+        return;
+      }
+
+      knowledgeResults.value = [...result.data.results];
+      knowledgeSearchState.value =
+        result.data.results.length === 0 ? "empty" : "success";
+      focus(knowledgeResultsHeading);
+      return;
+    }
+
+    // 明確 401 立即交回既有登入畫面，並把焦點放回帳號欄位。
+    if (result.status === 401) {
+      cancelKnowledgeSearch();
+      logoutPending.value = false;
+      identity.value = null;
+      authState.value = "signed-out";
+      authMessage.value = "登入工作階段已失效，請重新登入後搜尋。";
+      focus(usernameInput);
+      return;
+    }
+
+    // 固定安全錯誤不顯示服務端本文，保留表單供使用者修正或重試。
+    if (result.status === 422) {
+      knowledgeSearchError.value = "搜尋關鍵字未通過格式檢查，請修正後重試。";
+    } else if (result.status === 403) {
+      knowledgeSearchError.value =
+        "搜尋要求未通過來源驗證，請重新載入本機頁面後重試。";
+    } else if (result.status === 503) {
+      // 本次狀態回讀取代同一前景週期的檢查，避免兩個回應交錯。
+      foregroundEpoch += 1;
+      lastForegroundCheckEpoch = foregroundEpoch;
+      foregroundCheckRequested = false;
+      const foregroundOperation = activeOperation.value;
+      if (foregroundOperation && foregroundOperation.foregroundEpoch !== null) {
+        // 先釋放前景讀取擁有權再取消，保持有效登出不被搜尋鎖住。
+        activeOperation.value = null;
+        foregroundOperation.controller.abort();
+      }
+
+      // 回讀負責確認整個工作台的啟用狀態，編輯關鍵字只取消搜尋。
+      const readback: Operation = {
+        controller: new AbortController(),
+        foregroundEpoch: null,
+      };
+      knowledgeSetupReadback?.controller.abort();
+      knowledgeSetupReadback = readback;
+      const readSequence = ++setupReadSequence;
+      const setupResult = await requestApi("/api/setup", readback, {
+        method: "GET",
+      });
+
+      // 只釋放自己的回讀；身分失效或卸載後不得再更新工作台。
+      if (knowledgeSetupReadback !== readback) {
+        return;
+      }
+      knowledgeSetupReadback = null;
+      if (readback.controller.signal.aborted) {
+        return;
+      }
+
+      // 只有最新讀取可更新共享狀態；未啟用或無法確認都回到啟用說明。
+      const isLatestSetupRead = readSequence === setupReadSequence;
+      if (isLatestSetupRead) {
+        const nextSetup =
+          setupResult.status === 200 && isSetupDto(setupResult.data)
+            ? setupResult.data
+            : null;
+        if (nextSetup?.status !== "ready") {
+          setupStatus.value = nextSetup;
+          hasSetupError.value = nextSetup === null;
+          identity.value = null;
+          authState.value = nextSetup ? "signed-out" : "error";
+          authMessage.value = "";
+          focusSetupResult();
+          return;
+        }
+      }
+
+      // 仍是原搜尋才顯示手動重試；遲到的回讀不改動新查詢或焦點。
+      if (!isCurrentKnowledgeSearch(operation, owner)) {
+        return;
+      }
+      knowledgeSearchError.value = isLatestSetupRead
+        ? "知識搜尋暫時無法使用，服務仍已啟用。請稍後手動重試。"
+        : "服務狀態已重新確認，請再次手動搜尋。";
+    } else {
+      // 網路失敗、逾時及其他未知狀態都使用安全文案且不自動重試。
+      knowledgeSearchError.value =
+        "目前無法完成知識搜尋，請檢查本機服務後手動重試。";
+    }
+
+    // 錯誤保留在搜尋區並聚焦標題，讓鍵盤使用者直接讀取復原方式。
+    knowledgeSearchState.value = "error";
+    focus(knowledgeSearchErrorHeading);
+  } finally {
+    // 只釋放本次控制器參照，不讓舊查詢覆寫較新的搜尋狀態。
+    if (knowledgeSearchController === operation.controller) {
+      knowledgeSearchController = null;
+    }
+  }
+}
+
 // 登出失敗或逾時時只讀回 session，避免盲目重送非冪等異動。
 async function submitLogout(): Promise<void> {
   // 由有效工作台發起登出；未確認的嘗試即使失去啟用仍允許手動重試。
@@ -643,6 +909,31 @@ watch(username, (next, previous) => {
   }
 });
 
+// 服務失效、身分清除或切換時立即取消搜尋及回讀，並清除可能私有的結果。
+watch(
+  [isServiceReady, identity],
+  ([ready, currentIdentity], previous) => {
+    // 確認身分離開或更換時，避免共用瀏覽器帶入前一人的關鍵字。
+    const identityChanged =
+      previous[1] !== null && previous[1] !== currentIdentity;
+    if (identityChanged) {
+      knowledgeQuery.value = "";
+    }
+
+    // 同步撤銷舊身分的取消權，避免回應在下一次畫面更新前落地。
+    // prettier-ignore
+    if (
+      !ready
+      || !currentIdentity
+      || identityChanged
+    ) {
+      cancelKnowledgeSearch();
+      knowledgeSetupReadback?.controller.abort();
+    }
+  },
+  { flush: "sync" },
+);
+
 // 靜態頁掛載後才讀取服務與登入狀態，保持 generate 不依賴後端。
 onMounted(() => {
   // 初次狀態確認與手動恢復使用同一路徑，不呼叫模型或重試。
@@ -659,6 +950,10 @@ onBeforeUnmount(() => {
   window.removeEventListener("blur", leaveForeground);
   window.removeEventListener("focus", checkSetupOnForeground);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
+
+  // 工作台卸載時取消獨立搜尋及回讀，避免遲到結果留在新畫面。
+  cancelKnowledgeSearch();
+  knowledgeSetupReadback?.controller.abort();
 
   // 先撤銷畫面更新權，再中止請求及其後續 readback。
   const operation = activeOperation.value;
@@ -897,10 +1192,136 @@ onBeforeUnmount(() => {
           {{ authMessage }}
         </p>
 
-        <section class="empty-state" aria-labelledby="empty-state-title">
-          <p class="eyebrow">角色已確認</p>
-          <h2 id="empty-state-title">工作台已就緒</h2>
-          <p>{{ emptyStateDescription }}</p>
+        <section
+          class="knowledge-search"
+          aria-labelledby="knowledge-search-title"
+        >
+          <p class="eyebrow">知識文件</p>
+          <h2 id="knowledge-search-title">搜尋知識文件</h2>
+          <p class="knowledge-search-intro">
+            搜尋已匯入的真實文件片段，顯示原文件摘錄。
+          </p>
+
+          <form
+            class="knowledge-search-form login-form"
+            :aria-busy="knowledgeSearchState === 'loading'"
+            @submit.prevent="submitKnowledgeSearch"
+          >
+            <div class="field-group">
+              <label for="knowledge-query">搜尋關鍵字</label>
+              <input
+                id="knowledge-query"
+                ref="knowledgeQueryInput"
+                v-model="knowledgeQuery"
+                name="query"
+                type="search"
+                required
+                :aria-invalid="knowledgeQueryError ? 'true' : undefined"
+                :aria-describedby="
+                  knowledgeQueryError
+                    ? 'knowledge-query-help knowledge-query-error'
+                    : 'knowledge-query-help'
+                "
+                @input="handleKnowledgeQueryInput"
+              />
+              <p id="knowledge-query-help" class="knowledge-search-help">
+                最多 2,000 個 Unicode 字元。中文採字面子字串搜尋。
+              </p>
+              <p
+                v-if="knowledgeQueryError"
+                id="knowledge-query-error"
+                class="form-feedback"
+                role="alert"
+              >
+                {{ knowledgeQueryError }}
+              </p>
+            </div>
+            <button
+              type="submit"
+              class="primary-action"
+              :disabled="knowledgeSearchState === 'loading'"
+            >
+              {{
+                knowledgeSearchState === "loading"
+                  ? "搜尋中…"
+                  : knowledgeSearchState === "error"
+                    ? "重試搜尋"
+                    : "搜尋知識"
+              }}
+            </button>
+          </form>
+
+          <div
+            v-if="knowledgeSearchState === 'loading'"
+            class="knowledge-search-state"
+            role="status"
+          >
+            <h3>正在搜尋知識</h3>
+            <p>正在查詢本機知識文件，請稍候。</p>
+          </div>
+
+          <section
+            v-else-if="knowledgeSearchState === 'error'"
+            class="knowledge-search-feedback"
+            role="alert"
+          >
+            <h3 ref="knowledgeSearchErrorHeading" tabindex="-1">搜尋未完成</h3>
+            <p>{{ knowledgeSearchError }}</p>
+          </section>
+
+          <section
+            v-else-if="['empty', 'success'].includes(knowledgeSearchState)"
+            class="knowledge-results"
+            aria-labelledby="knowledge-results-title"
+          >
+            <h3
+              id="knowledge-results-title"
+              ref="knowledgeResultsHeading"
+              tabindex="-1"
+            >
+              搜尋結果
+            </h3>
+            <p v-if="knowledgeSearchState === 'empty'" role="status">
+              查無「{{ knowledgeQuery }}」的符合片段，可修改關鍵字後重試。
+            </p>
+            <template v-else>
+              <p role="status">
+                找到 {{ knowledgeResults.length }} 筆知識片段。
+              </p>
+              <ul class="knowledge-result-list">
+                <li
+                  v-for="result in knowledgeResults"
+                  :key="`${result.document_id}:${result.fragment_id}`"
+                  class="knowledge-result"
+                >
+                  <dl class="knowledge-result-details">
+                    <div>
+                      <dt>標題</dt>
+                      <dd>{{ result.title }}</dd>
+                    </div>
+                    <div>
+                      <dt>版本</dt>
+                      <dd>
+                        <code>{{ result.version }}</code>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>來源</dt>
+                      <dd>
+                        文件 <code>{{ result.document_id }}</code
+                        >，片段
+                        <code>{{ result.fragment_id }}</code>
+                      </dd>
+                    </div>
+                    <div class="knowledge-result-excerpt">
+                      <dt>完整摘錄</dt>
+                      <dd>{{ result.excerpt }}</dd>
+                    </div>
+                  </dl>
+                </li>
+              </ul>
+            </template>
+          </section>
         </section>
 
         <p class="workbench-note">

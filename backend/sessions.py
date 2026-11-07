@@ -199,7 +199,7 @@ def login(
     return Identity(username=username, role=cast(Role, username)), token
 
 
-# 同列序列化查詢與登出；過期或已撤銷的工作階段無法恢復。
+# 工作階段入口自管交易；其他業務可在自己的交易內共用列鎖驗證。
 def active_session(
     settings: Settings, token: str | None, *, refresh: bool
 ) -> Identity | None:
@@ -208,31 +208,39 @@ def active_session(
     if digest is None:
         return None
 
+    # 離開交易時提交刷新或刪除，包括找不到有效身分的情況。
     with settings.connect() as conn:
-        # 先取得列鎖，避免用等待期間已經過時的時間接受逾期工作階段。
-        row = conn.execute(
-            """
-            SELECT username, created_at, last_seen_at FROM login_sessions
-            WHERE token_digest = %s FOR UPDATE
-            """,
-            (digest,),
-        ).fetchone()
-        if row is None:
-            return None
+        return read_active_session(conn, digest, refresh=refresh)
 
-        # 兩種查詢共用期限；首次觀察到期即刪除，避免時鐘回撥恢復憑證。
-        username, created_at, last_seen_at = cast(tuple[Role, datetime, datetime], row)
-        at = utc_now()
-        if last_seen_at <= at - SESSION_IDLE or created_at <= at - SESSION_MAX:
-            revoke_session(conn, digest)
-            return None
 
-        # 只有主動刷新能推進活動時間；仍持有列鎖，且時鐘回撥時不倒退。
-        if refresh and at > last_seen_at:
-            conn.execute(
-                "UPDATE login_sessions SET last_seen_at = %s WHERE token_digest = %s",
-                (at, digest),
-            )
+# 呼叫端的交易持有同一列鎖，讓檢查、讀取或刷新與登出依序完成。
+def read_active_session(
+    conn: psycopg.Connection[tuple[object, ...]], digest: bytes, *, refresh: bool
+) -> Identity | None:
+    # 先取得列鎖，避免用等待期間已經過時的時間接受逾期工作階段。
+    row = conn.execute(
+        """
+        SELECT username, created_at, last_seen_at FROM login_sessions
+        WHERE token_digest = %s FOR UPDATE
+        """,
+        (digest,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    # 共用期限；首次觀察到期即刪除，避免時鐘回撥恢復憑證。
+    username, created_at, last_seen_at = cast(tuple[Role, datetime, datetime], row)
+    at = utc_now()
+    if last_seen_at <= at - SESSION_IDLE or created_at <= at - SESSION_MAX:
+        revoke_session(conn, digest)
+        return None
+
+    # 只有主動刷新能推進活動時間；仍持有列鎖，且時鐘回撥時不倒退。
+    if refresh and at > last_seen_at:
+        conn.execute(
+            "UPDATE login_sessions SET last_seen_at = %s WHERE token_digest = %s",
+            (at, digest),
+        )
     return Identity(username=username, role=username)
 
 

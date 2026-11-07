@@ -16,12 +16,12 @@ test_compose() {
 
 # 先驗證命令參數；Key 只能透過互動提示輸入。
 if [ "$#" -ne 1 ]; then
-    printf '%s\n' '用法：./bin/local {up|stop|set-key|verify-key|test|check|stop-test}' >&2
+    printf '%s\n' '用法：./bin/local {up|stop|set-key|verify-key|import-knowledge|test|check|stop-test}' >&2
     exit 2
 fi
 
 case "$1" in
-    up|stop|verify-key)
+    up|stop|verify-key|import-knowledge)
         # 應用程式使用本機檔案的擁有者身分，密碼不經 Compose 環境變數。
         AI_SUPPORT_UID=$(id -u)
         AI_SUPPORT_GID=$(id -g)
@@ -45,6 +45,10 @@ case "$1" in
         # 使用同一個正在執行的後端，並保留驗證程式的退出碼。
         app_compose exec -T app python -m backend.cli verify-key
         ;;
+    import-knowledge)
+        # 只讀專案內的固定文件，透過 stdin 匯入執行中的後端並保留退出碼。
+        app_compose exec -T app python -m backend.cli import-knowledge < knowledge/documents.json
+        ;;
     test)
         test_compose run --rm --build test
         ;;
@@ -61,7 +65,7 @@ case "$1" in
         test_compose stop
         ;;
     *)
-        printf '%s\n' '用法：./bin/local {up|stop|set-key|verify-key|test|check|stop-test}' >&2
+        printf '%s\n' '用法：./bin/local {up|stop|set-key|verify-key|import-knowledge|test|check|stop-test}' >&2
         exit 2
         ;;
 esac

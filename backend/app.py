@@ -11,7 +11,7 @@ from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import RequestResponseEndpoint
 
-from backend import sessions
+from backend import knowledge, sessions
 from backend.activation import setup_status
 from backend.credentials import CredentialError
 from backend.database import Settings, initialize
@@ -20,6 +20,7 @@ from backend.http_security import LOCAL_HOSTS, ApiRequestMiddleware
 STATIC = Path(__file__).parents[1] / "public"
 LOGIN_INVALID = "登入欄位格式不正確。"
 LOGIN_DENIED = "帳號或密碼不正確。"
+SEARCH_INVALID = "搜尋欄位格式不正確。"
 
 
 # 同一個來源用同一個標準 IP 表示；來源只取 ASGI 對端，無法以 HTTP 標頭改寫。
@@ -167,6 +168,41 @@ def create_app(settings: Settings | None = None, static: Path = STATIC) -> FastA
             samesite="lax",
         )
         return response
+
+    @app.post("/api/knowledge/search")
+    # 搜尋只接受有界的同源 JSON；沿用啟用與工作階段驗證，不呼叫模型。
+    async def search_knowledge(request: Request) -> knowledge.SearchResponse:
+        # 中介層已限制本文大小；自行解析，避免格式錯誤回顯查詢內容。
+        types = request.headers.getlist("content-type")
+        if (
+            len(types) != 1
+            or types[0].split(";", 1)[0].strip().lower() != "application/json"
+        ):
+            raise HTTPException(status_code=422, detail=SEARCH_INVALID)
+        try:
+            form = knowledge.SearchInput.model_validate(
+                knowledge.parse_json(await request.body())
+            )
+        except (ValueError, RecursionError):
+            raise HTTPException(status_code=422, detail=SEARCH_INVALID) from None
+
+        # 列鎖與資料查詢放到工作執行緒；等交易完成後才回覆結果或拒絕原因。
+        try:
+            results = await run_in_threadpool(
+                knowledge.search,
+                request.app.state.settings,
+                request.cookies.get(sessions.COOKIE_NAME),
+                form.query.strip(),
+            )
+        except knowledge.ActivationRequired as error:
+            raise HTTPException(status_code=503, detail=str(error)) from None
+        except psycopg.Error:
+            raise HTTPException(
+                status_code=503, detail="目前無法搜尋知識文件。"
+            ) from None
+        if results is None:
+            raise HTTPException(status_code=401, detail="請先登入。")
+        return results
 
     @app.get("/health")
     # 提供不會接觸模型的本機存活檢查。

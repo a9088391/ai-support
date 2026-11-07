@@ -46,3 +46,11 @@ CREATE TABLE IF NOT EXISTS login_rate_limits (
     expires_at timestamptz NOT NULL,
     PRIMARY KEY (dimension, bucket)
 );
+
+-- 每列保存文件目前版本與其片段；同批匯入只替換本表。
+CREATE TABLE IF NOT EXISTS knowledge_documents (
+    id text PRIMARY KEY,
+    title text NOT NULL,
+    version text NOT NULL,
+    fragments jsonb NOT NULL
+);

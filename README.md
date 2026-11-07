@@ -1,6 +1,6 @@
 # AI 客服工單與知識查詢
 
-目前已實作本機啟動、Gemini 啟用、示範帳號登入登出與角色工作台。FastAPI 同源提供 Nuxt 靜態頁面，並使用 PostgreSQL 18 保存啟用狀態、模型用量與工作階段。知識問答及工單功能將在後續交付。
+目前已實作本機啟動、Gemini 啟用、示範帳號登入登出，以及角色工作台中的知識搜尋。FastAPI 同源提供 Nuxt 靜態頁面，並使用 PostgreSQL 18 保存啟用狀態、模型用量、工作階段與目前知識文件。AI 問答及工單功能將在後續交付。
 
 ## 啟動與驗證
 
@@ -42,6 +42,22 @@
 - 以每個帳號與連線來源分別計算 15 分鐘時間窗。每個帳號最多 5 次，每個來源最多 20 次。登入成功也計入嘗試次數。達上限後，畫面會請你稍後再試。
 - 登入閒置 30 分鐘或累計 8 小時後失效。共用裝置使用完畢後，請在工作台登出。登出會立即撤銷目前的工作階段。
 
+## 匯入與搜尋知識文件
+
+以 `./bin/local up` 啟動目前版本後，在專案根目錄執行以下命令，載入隨附的虛構「星港工作台」文件。
+
+```sh
+./bin/local import-knowledge
+```
+
+服務啟用後，兩種示範帳號都能在工作台搜尋。可試著搜尋 `出報表` 或 `export-104`，查看文件標題、版本、來源識別及純文字摘錄。首次匯入前，查詢會顯示查無符合的片段。搜尋直接讀取 PostgreSQL，不呼叫 Gemini，也不消耗模型額度。
+
+更新時編輯 [knowledge/documents.json](knowledge/documents.json)，再執行同一命令。保留相同文件與片段的穩定 `id`，修改標題或片段內容時更新文件的 `version`。同一份檔案可重複匯入。整批成功才替換目前可搜尋的文件，未列在新批次的文件會移除。格式錯誤或資料庫寫入失敗時保留原批，命令會以非零狀態結束。請保留前一版 JSON，需要還原時可重新匯入。
+
+- 批次使用 UTF-8 JSON，最多 4 MiB，須包含 1 到 200 份文件，每份含 1 到 100 個片段。每份文件有 `id`、`title`、`version`、`fragments`，片段有 `id`、`text`。
+- 識別長度最多 64 字元，須以小寫英文字母或數字開頭，可用小寫英文字母、數字、底線與連字號。文件識別須在整批內唯一，片段識別須在各文件內唯一。標題、版本與片段文字最多分別為 200、64、4,000 個 Unicode 字元。
+- 搜尋輸入最多 2,000 個 Unicode 字元，依標題或片段的字面子字串比對，忽略 ASCII 英文字母大小寫及查詢首尾空白。結果依文件與片段識別排序，最多 20 筆。
+
 ## 開發與測試
 
 ```sh
@@ -50,7 +66,7 @@
 ./bin/local stop-test
 ```
 
-`check` 執行 Python 語法、Ruff、mypy 與套件相容性檢查。`test` 使用獨立的 `ai-support-test` 專案與 PostgreSQL 18，涵蓋公開 HTTP 啟用、登入安全、工作階段期限與併發行為，並透過受控 HTTP 傳輸驗證官方 Gemini SDK。測試容器使用合成資料與憑證，測試資料庫在停止時丟棄。
+`check` 執行 Python 語法、Ruff、mypy 與套件相容性檢查。`test` 使用獨立的 `ai-support-test` 專案與 PostgreSQL 18，涵蓋公開 HTTP 啟用、登入安全、工作階段期限、知識匯入／搜尋與併發行為，並透過受控 HTTP 傳輸驗證官方 Gemini SDK。測試容器使用合成資料與憑證，測試資料庫在停止時丟棄。
 
 前端開發使用 Node.js 24.22.2；Docker 建置已鎖定相同版本。使用符合 `frontend/package.json` 的主機 Node.js 後，可另外執行格式、型別及靜態輸出檢查：
 
@@ -70,10 +86,12 @@ node tests/fixture-server.mjs invalid 18021
 
 模式包括 `unconfigured`、`unverified`、`ready`、`invalid`、`unavailable`（503）、`malformed`（不符合契約）及 `timeout`（超過前端十秒界線）。埠號可省略，預設為 8021，只能綁定本機。這個工具提供前端建置結果與固定測試狀態。`ready` 會顯示未登入的表單，完整登入流程請用 `./bin/local up` 與實際 PostgreSQL 驗證。
 
-目前已通過 56 項後端測試、Python 靜態檢查、前端格式／型別／建置，以及桌面與手機的雙角色登入與登出檢查。先前已以虛構 `AQ.` 資料驗證終端的隱藏輸入、儲存與損毀復原。2026-11-07 已完成一次真實 Gemini 啟用驗證，頁面與 API 均為 `ready`。重啟及更新後保留啟用狀態，本機記錄的模型請求與當日用量皆維持 1 次。知識問答與工具品質評估會隨後續功能驗證。
+目前已通過 68 項後端測試、Python 靜態檢查、前端格式／型別／建置，以及桌面與手機的雙角色登入與登出檢查。先前已以虛構 `AQ.` 資料驗證終端的隱藏輸入、儲存與損毀復原。2026-11-07 已完成一次真實 Gemini 啟用驗證，頁面與 API 均為 `ready`。重啟及更新後保留啟用狀態，本機記錄的模型請求與當日用量皆維持 1 次。知識搜尋另在隔離的 PostgreSQL 18 與 Chrome 桌面、手機視窗驗證。匯入失敗後舊批仍可查，搜尋不新增模型用量。知識問答與工具品質評估會隨後續功能驗證。
 
 應用程式的 HTTP 存活檢查是 `GET /health`。啟用頁使用 `GET /api/setup`，回傳 `status`、`message`、`model`。驗證由本機命令觸發。
 
 服務啟用後，`POST /api/login` 接收 JSON 的 `username`、`password`，登入成功後設定 `HttpOnly`、`SameSite=Lax` 的 Cookie。登入與 `GET /api/session` 只回傳 `username`、`role`。`POST /api/logout` 撤銷工作階段並清除 Cookie，即使服務已失去啟用狀態仍可呼叫。若網路中斷而無法確認登出，畫面會提供手動重試。
 
 異動請求需帶同源 `Origin` 及 `X-CSRF-Protection: 1`。`GET /api/session` 同樣需要 `X-CSRF-Protection: 1`，若附帶 `Origin`，它必須同源。查詢預設刷新閒置期限。頁面首次載入使用 `GET /api/session?refresh=false` 確認身分，保留原本的期限。API 請求本文上限為 64 KiB。
+
+`POST /api/knowledge/search` 使用同源及有效的登入 Cookie，送出 JSON 的 `query`。成功回傳 `results` 陣列，每筆包含 `document_id`、`title`、`version`、`fragment_id`、`excerpt`。查無結果時為空陣列。欄位不符回傳 `422`，未登入回傳 `401`，未啟用或目前無法查詢時回傳 `503`。

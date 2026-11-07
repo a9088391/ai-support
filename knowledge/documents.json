@@ -1,0 +1,41 @@
+{
+  "documents": [
+    {
+      "id": "report-export",
+      "title": "星港工作台：匯出報表與 EXPORT-104",
+      "version": "v1",
+      "fragments": [
+        {
+          "id": "export-steps",
+          "text": "在「報表」選擇日期區間，再按「匯出報表」。完成後可在「下載紀錄」取得 CSV 檔。"
+        },
+        {
+          "id": "export-104",
+          "text": "遇到 EXPORT-104 時，請將日期區間縮短至 31 天以內，再重新匯出。"
+        }
+      ]
+    },
+    {
+      "id": "notification-settings",
+      "title": "星港工作台：通知設定",
+      "version": "v1",
+      "fragments": [
+        {
+          "id": "weekly-digest",
+          "text": "在「個人設定」的「通知」區塊，可切換每週摘要。關閉摘要仍會收到登入安全通知。"
+        }
+      ]
+    },
+    {
+      "id": "workspace-access",
+      "title": "星港工作台：工作區權限",
+      "version": "v1",
+      "fragments": [
+        {
+          "id": "viewer",
+          "text": "檢視者可閱讀共享報表，無法修改工作區設定。需要編輯時，請向工作區擁有者申請。"
+        }
+      ]
+    }
+  ]
+}

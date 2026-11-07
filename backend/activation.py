@@ -1,7 +1,7 @@
 from typing import Literal
 from uuid import uuid4
 
-from psycopg import DatabaseError
+from psycopg import Connection, DatabaseError
 from pydantic import BaseModel
 
 from backend.credentials import CredentialError, read_key
@@ -15,6 +15,10 @@ MESSAGES: dict[SetupState, str] = {
     "ready": "目前的 Gemini 設定已通過驗證。",
     "invalid": "Google 已拒絕目前的憑證。請由本機操作人員更換 Key 並重新驗證。",
 }
+ACTIVATION_ROW = (
+    "SELECT status, key_version, fingerprint, provider, model "
+    "FROM activation WHERE singleton"
+)
 
 
 class SetupResponse(BaseModel):
@@ -24,7 +28,14 @@ class SetupResponse(BaseModel):
 
 
 # 依每次讀到的憑證比對驗證紀錄，只回傳安全的公開狀態。
-def setup_status(settings: Settings) -> SetupResponse:
+def setup_status(
+    settings: Settings, *, lock_with: Connection[tuple[object, ...]] | None = None
+) -> SetupResponse:
+    # 業務讀取要先取得共用列鎖再讀 Key，以免等待驗證寫入時沿用舊設定。
+    row = None
+    if lock_with is not None:
+        row = lock_with.execute(ACTIVATION_ROW + " FOR SHARE").fetchone()
+
     # 缺少憑證或檔案有誤時直接關閉業務入口。
     try:
         key = read_key(settings.key_file)
@@ -36,23 +47,18 @@ def setup_status(settings: Settings) -> SetupResponse:
     if key is None:
         return SetupResponse(status="unconfigured", message=MESSAGES["unconfigured"])
 
-    # 只有當版本、Key 指紋、供應商與模型全部吻合，才沿用之前的驗證結果。
-    with settings.connect() as conn:
-        row = conn.execute(
-            """
-            SELECT status FROM activation
-            WHERE singleton AND key_version = %s AND fingerprint = %s
-                AND provider = %s AND model = %s
-            """,
-            (key.version, key.fingerprint, PROVIDER, MODEL),
-        ).fetchone()
+    # 入口查詢保持無列鎖，且在無可用 Key 時不連線。
+    if lock_with is None:
+        with settings.connect() as conn:
+            row = conn.execute(ACTIVATION_ROW).fetchone()
 
-    # 以已知狀態產生 DTO，未知紀錄不放行。
+    # 只有版本、指紋、供應商及模型皆相符，才承認已有的驗證狀態。
     status: SetupState = "unverified"
-    if row and row[0] == "ready":
-        status = "ready"
-    elif row and row[0] == "invalid":
-        status = "invalid"
+    if row is not None and row[1:] == (key.version, key.fingerprint, PROVIDER, MODEL):
+        if row[0] == "ready":
+            status = "ready"
+        elif row[0] == "invalid":
+            status = "invalid"
     return SetupResponse(status=status, message=MESSAGES[status])
 
 

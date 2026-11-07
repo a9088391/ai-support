@@ -169,6 +169,13 @@ async function handleRequest(request, response) {
     return;
   }
 
+  // ready 模式只模擬未登入讀取，絕不建立 Cookie 或提供示範密碼。
+  if (requestUrl.pathname === "/api/session" && mode === "ready") {
+    console.log("TEST FIXTURE GET /api/session (unauthenticated)");
+    sendJson(response, 401, { detail: "測試替身不保存登入狀態。" });
+    return;
+  }
+
   // 不替其他 API 路由提供資料，避免把測試替身誤用成業務服務。
   if (requestUrl.pathname.startsWith("/api/")) {
     sendJson(response, 404, { detail: "測試替身只提供啟用狀態。" });

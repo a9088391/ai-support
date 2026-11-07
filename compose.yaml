@@ -44,6 +44,12 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: bind
+        source: ./.local/demo-passwords
+        target: /run/ai-support/demo-passwords
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).close()"]
       interval: 2s

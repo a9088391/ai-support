@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from backend import credentials
-from backend.credentials import CredentialError, read_key
+from backend.credentials import CredentialError, read_demo_passwords, read_key
 
 
 @pytest.mark.parametrize(
@@ -28,11 +28,21 @@ def test_local_credentials(
     local = Path(".local")
     password_path = local / "database-password"
     password = password_path.read_bytes()
+    demo_file = local / "demo-passwords"
+    demo_passwords = read_demo_passwords(demo_file)
+    demo_inode = demo_file.stat().st_ino
     assert password.strip()
     assert stat.S_IMODE(local.stat().st_mode) == 0o700
     assert stat.S_IMODE(password_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(demo_file.stat().st_mode) == 0o600
+    assert all(len(value) == 43 for value in demo_passwords)
+    assert demo_passwords[0] != demo_passwords[1]
     assert credentials.main(["prepare"]) == 0
     assert password_path.read_bytes() == password
+    assert demo_file.stat().st_ino == demo_inode
+    assert read_demo_passwords(demo_file) == demo_passwords
+    output = capsys.readouterr()
+    assert all(value not in output.out + output.err for value in demo_passwords)
 
     # 模擬本機隱藏輸入，確認儲存後只有擁有者可讀寫。
     terminal_input = valid_key
@@ -76,6 +86,19 @@ def test_local_credentials(
     assert read_key(key_path) == key
     output = capsys.readouterr()
     assert valid_key not in output.out + output.err
+
+
+# 既有示範密碼檔無法安全讀取時，初始化不得自動覆寫或回顯內容。
+def test_demo_passwords_preserve_invalid_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert credentials.main(["prepare"]) == 0
+    demo_file = Path(".local/demo-passwords")
+    demo_file.write_text("fixture-malformed-password\n")
+    assert credentials.main(["prepare"]) == 1
+    assert demo_file.read_text() == "fixture-malformed-password\n"
+    assert "fixture-malformed-password" not in capsys.readouterr().err
 
 
 # 讀取範圍限擁有者的普通檔案，錯誤訊息不揭露檔案內容。

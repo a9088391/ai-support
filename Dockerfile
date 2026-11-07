@@ -27,4 +27,4 @@ COPY backend/*.py backend/schema.sql backend/
 COPY --from=frontend /src/.output/public/ /app/public/
 EXPOSE 8000
 USER 10001:10001
-CMD ["python", "-m", "uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+CMD ["python", "-m", "uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--no-proxy-headers"]

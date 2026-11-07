@@ -1,6 +1,6 @@
 import fcntl
 import hashlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -17,59 +17,6 @@ from backend.database import Settings, initialize, reserve_request
 from backend.provider import MODEL
 from backend.tests.test_provider import SUCCESS
 from fastapi.testclient import TestClient
-
-TEST_DSN = "host=db dbname=ai_support_test user=ai_support_test password=disposable-fixture-only"
-
-
-@pytest.fixture
-# 先辨識本案專用 PostgreSQL，再允許任何 schema 或測試資料寫入。
-def settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
-    current = Settings(tmp_path / "api-key", TEST_DSN)
-
-    # 帳號、資料庫、版本及伺服器標記都吻合才能清理這個可拋棄的測試庫。
-    with current.connect() as conn:
-        identity = conn.execute(
-            """
-            SELECT current_database(), current_user, current_setting('ai_support.test_fixture', true),
-                   current_setting('server_version_num')::int / 10000
-            """
-        ).fetchone()
-    if identity != ("ai_support_test", "ai_support_test", "disposable-ticket01", 18):
-        pytest.fail("拒絕使用非本案專用的 PostgreSQL 18 測試資料庫。")
-
-    # 每案從空白業務資料開始，CLI 走與 HTTP 同一組設定。
-    initialize(current)
-    with current.connect() as conn:
-        conn.execute("TRUNCATE activation, model_requests, daily_model_quota")
-        conn.execute("INSERT INTO activation DEFAULT VALUES")
-
-    # 只替換環境讀取，保留 CLI、啟用、PostgreSQL、真實 SDK 與傳輸邊界。
-    def fixture_configuration() -> Settings:
-        return current
-
-    monkeypatch.setattr(
-        Settings, "from_environment", staticmethod(fixture_configuration)
-    )
-    return current
-
-
-@pytest.fixture
-# PostgreSQL 和 API 端點使用真實實作，只替換外部網路回覆。
-def mocked_provider(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[tuple[list[httpx.Request], list[Callable[[], httpx.Response]]]]:
-    requests: list[httpx.Request] = []
-    responses: list[Callable[[], httpx.Response]] = []
-
-    # 每次發送必須是預期的 HTTPS Interactions POST，且只有排定的回覆可用。
-    def send(_: httpx.HTTPTransport, request: httpx.Request) -> httpx.Response:
-        assert request.url.host == "generativelanguage.googleapis.com"
-        assert request.url.path == "/v1/interactions"
-        requests.append(request)
-        return responses.pop(0)()
-
-    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", send)
-    yield requests, responses
 
 
 # 產生成功回應供啟用流程使用，格式沿用固定 SDK 的 HTTP 契約。
@@ -94,6 +41,24 @@ def assert_setup(client: TestClient, state: str) -> None:
     assert business.headers["content-type"] == "application/json"
 
 
+# 以已完成啟用的公開 HTTP 入口區分服務可用與瀏覽器尚未登入。
+def test_ready_session_requires_login(
+    settings: Settings,
+    mocked_provider: tuple[list[httpx.Request], list[Callable[[], httpx.Response]]],
+) -> None:
+    requests, responses = mocked_provider
+    set_key(settings.key_file, "fixture-session-key")
+    responses.append(success)
+    assert cli.main(["verify-key"]) == 0
+
+    # 通過來源防護但沒有登入憑證時，查詢須回傳未登入且不得外呼。
+    with TestClient(create_app(settings), base_url="http://localhost") as client:
+        response = client.get("/api/session", headers={"X-CSRF-Protection": "1"})
+        assert response.status_code == 401
+        assert response.headers["cache-control"] == "no-store"
+    assert len(requests) == 1
+
+
 # 驗證未設定到就緒、重啟、換回同 Key 與供應商／模型不符的 API 和 CLI 行為。
 def test_activation_lifecycle(
     settings: Settings,
@@ -108,7 +73,13 @@ def test_activation_lifecycle(
     with TestClient(create_app(settings), base_url="http://localhost") as client:
         assert client.get("/health").status_code == 200
         assert_setup(client, "unconfigured")
-        assert client.post("/api/setup").status_code == 503
+        assert (
+            client.post(
+                "/api/setup",
+                headers={"Origin": "http://localhost", "X-CSRF-Protection": "1"},
+            ).status_code
+            == 503
+        )
         assert cli.main(["verify-key"]) == 1
         assert not requests
 

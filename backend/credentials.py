@@ -14,6 +14,11 @@ from uuid import UUID, uuid4
 
 LOCAL_DIR = Path(".local")
 KEY_NAME = "api-key"
+DEMO_PASSWORDS_NAME = "demo-passwords"
+DEMO_ACCOUNTS = ("user", "support")
+DEMO_PASSWORDS_FORMAT = re.compile(
+    r"user=([A-Za-z0-9_-]{43})\nsupport=([A-Za-z0-9_-]{43})\n"
+)
 # 新版 AQ. 驗證金鑰含點號；讀寫共用相同的 ASCII 字元與長度限制。
 KEY_FORMAT = re.compile(r"[A-Za-z0-9_.-]{1,256}")
 
@@ -84,6 +89,15 @@ def read_key(path: Path) -> GeminiCredential | None:
         return GeminiCredential(UUID(version), key)
     except ValueError:
         raise CredentialFormatError("本機 Key 格式不正確，請重新設定。") from None
+
+
+# 示範密碼固定由本機初始化產生，檔案有誤時提供安全診斷。
+def read_demo_passwords(path: Path) -> tuple[str, str]:
+    content = read_private(path)
+    match = DEMO_PASSWORDS_FORMAT.fullmatch(content) if content is not None else None
+    if match is None or match[1] == match[2]:
+        raise CredentialError("找不到可用的示範帳號密碼檔，請檢查本機設定。")
+    return match[1], match[2]
 
 
 # 依呼叫者取得的檔案狀態驗證目錄型態、擁有者與權限。
@@ -162,7 +176,7 @@ def main(args: list[str]) -> int:
         return 2
 
     try:
-        # 啟動與設定共用目錄檢查；每次準備只初始化不存在的資料庫密碼。
+        # 啟動與設定共用目錄檢查；準備只建立不存在的密碼檔。
         ensure_private_directory(LOCAL_DIR)
         key_dir = LOCAL_DIR / "gemini"
         ensure_private_directory(key_dir)
@@ -170,6 +184,19 @@ def main(args: list[str]) -> int:
             db_file = LOCAL_DIR / "database-password"
             if read_private(db_file) is None:
                 write_private(db_file, secrets.token_urlsafe(32) + "\n", replace=False)
+
+            # 分別取樣後以單檔排他公布，避免並行啟動或中斷留下半組密碼。
+            demo_file = LOCAL_DIR / DEMO_PASSWORDS_NAME
+            if read_private(demo_file) is None:
+                write_private(
+                    demo_file,
+                    "".join(
+                        f"{account}={secrets.token_urlsafe(32)}\n"
+                        for account in DEMO_ACCOUNTS
+                    ),
+                    replace=False,
+                )
+            read_demo_passwords(demo_file)
             return 0
 
         # 無法關閉回顯就終止，避免 Key 從管線、命令列或可見終端輸入。

@@ -7,7 +7,12 @@ from uuid import UUID
 import psycopg
 from psycopg.conninfo import make_conninfo
 
-from backend.credentials import KEY_NAME, CredentialError, read_private
+from backend.credentials import (
+    DEMO_PASSWORDS_NAME,
+    KEY_NAME,
+    CredentialError,
+    read_private,
+)
 from backend.provider import Delivery
 
 SCHEMA = Path(__file__).with_name("schema.sql")
@@ -17,6 +22,7 @@ SCHEMA = Path(__file__).with_name("schema.sql")
 class Settings:
     key_file: Path
     database_dsn: str = field(repr=False)
+    demo_passwords_file: Path
 
     # 只從內部掛載取得資料庫密碼，讓 HTTP 與 CLI 共用同一個部署設定。
     @classmethod
@@ -41,6 +47,12 @@ class Settings:
                 dbname="ai_support",
                 user="ai_support",
                 password=password.strip(),
+            ),
+            Path(
+                environ.get(
+                    "AI_SUPPORT_DEMO_PASSWORDS_FILE",
+                    f"/run/ai-support/{DEMO_PASSWORDS_NAME}",
+                )
             ),
         )
 

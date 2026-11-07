@@ -23,3 +23,26 @@ CREATE TABLE IF NOT EXISTS model_requests (
 );
 
 INSERT INTO activation DEFAULT VALUES ON CONFLICT DO NOTHING;
+
+-- 初始角色與帳號識別固定；資料庫只保存帶鹽的密碼雜湊。
+CREATE TABLE IF NOT EXISTS demo_accounts (
+    username text PRIMARY KEY CHECK (username IN ('user', 'support')),
+    password_hash text NOT NULL
+);
+
+-- Cookie 只以摘要索引；閒置與絕對期限都以 UTC 時間點比較。
+CREATE TABLE IF NOT EXISTS login_sessions (
+    token_digest bytea PRIMARY KEY,
+    username text NOT NULL REFERENCES demo_accounts (username),
+    created_at timestamptz NOT NULL,
+    last_seen_at timestamptz NOT NULL
+);
+
+-- 來源與帳號各自累計；帳號桶保存正規化名稱的摘要，避免保留原始輸入。
+CREATE TABLE IF NOT EXISTS login_rate_limits (
+    dimension text NOT NULL CHECK (dimension IN ('source', 'account')),
+    bucket text NOT NULL,
+    attempts integer NOT NULL CHECK (attempts > 0),
+    expires_at timestamptz NOT NULL,
+    PRIMARY KEY (dimension, bucket)
+);

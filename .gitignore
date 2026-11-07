@@ -1,0 +1,24 @@
+# AI 規劃及審查僅留本機。
+/AGENTS.md
+/.scratch/
+/docs/agents/
+
+# 本機設定及秘密不進版本控制。
+/.env
+/.env.*
+!/.env.example
+/.local/
+
+# 可重建依賴、建置及測試快取。
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+**/.venv/
+**/node_modules/
+**/.nuxt/
+**/.output/
+**/dist/
+/frontend/dist
+**/coverage/
+.DS_Store

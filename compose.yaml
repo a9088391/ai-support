@@ -1,0 +1,54 @@
+name: ai-support
+
+services:
+  db:
+    image: postgres:18.6@sha256:3a4264520e121176619f54ff867d12774bc81e95e7b84db58d63bccdb6144b81
+    environment:
+      POSTGRES_DB: ai_support
+      POSTGRES_USER: ai_support
+      POSTGRES_PASSWORD_FILE: /run/ai-support/database-password
+    volumes:
+      - database:/var/lib/postgresql
+      - type: bind
+        source: ./.local/database-password
+        target: /run/ai-support/database-password
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "ai_support", "-d", "ai_support"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      target: app
+    user: "${AI_SUPPORT_UID:?請透過 ./bin/local 啟動}:${AI_SUPPORT_GID:?請透過 ./bin/local 啟動}"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8020:8000"
+    volumes:
+      - type: bind
+        source: ./.local/gemini
+        target: /run/ai-support/gemini
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.local/database-password
+        target: /run/ai-support/database-password
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).close()"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  database:

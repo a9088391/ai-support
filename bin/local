@@ -1,0 +1,67 @@
+#!/bin/sh
+set -eu
+
+# 固定使用本案目錄及明確的 Compose project，避免混用其他專案的設定或資料。
+cd "$(dirname "$0")/.."
+
+# 正式環境與測試各用獨立設定，不讀取其他專案或工作目錄的 .env。
+app_compose() {
+    docker compose --env-file /dev/null -p ai-support -f compose.yaml "$@"
+}
+
+# 測試只使用沒有正式秘密掛載的專用網路及拋棄式資料庫。
+test_compose() {
+    docker compose --env-file /dev/null -p ai-support-test -f compose.test.yaml "$@"
+}
+
+# 先驗證命令參數；Key 只能透過互動提示輸入。
+if [ "$#" -ne 1 ]; then
+    printf '%s\n' '用法：./bin/local {up|stop|set-key|verify-key|test|check|stop-test}' >&2
+    exit 2
+fi
+
+case "$1" in
+    up|stop|verify-key)
+        # 應用程式使用本機檔案的擁有者身分，密碼不經 Compose 環境變數。
+        AI_SUPPORT_UID=$(id -u)
+        AI_SUPPORT_GID=$(id -g)
+        export AI_SUPPORT_UID AI_SUPPORT_GID
+        ;;
+esac
+
+case "$1" in
+    up)
+        python3 -m backend.credentials prepare
+        app_compose up -d --build --wait
+        printf '%s\n' 'AI 客服工作台 http://127.0.0.1:8020/'
+        ;;
+    stop)
+        app_compose stop
+        ;;
+    set-key)
+        exec python3 -m backend.credentials set-key
+        ;;
+    verify-key)
+        # 使用同一個正在執行的後端，並保留驗證程式的退出碼。
+        app_compose exec -T app python -m backend.cli verify-key
+        ;;
+    test)
+        test_compose run --rm --build test
+        ;;
+    check)
+        test_compose run --rm --build --no-deps test sh -ec '
+            python -m compileall -q backend
+            python -m ruff check backend
+            python -m ruff format --check backend
+            python -m mypy --config-file backend/pyproject.toml backend
+            python -m pip check
+        '
+        ;;
+    stop-test)
+        test_compose stop
+        ;;
+    *)
+        printf '%s\n' '用法：./bin/local {up|stop|set-key|verify-key|test|check|stop-test}' >&2
+        exit 2
+        ;;
+esac

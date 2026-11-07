@@ -1,0 +1,21 @@
+# 只送建置需要的檔案，防止把本機 Key 或工作資料傳進 Docker context。
+**
+!Dockerfile
+!backend/
+!backend/*.py
+!backend/*.sql
+!backend/*.toml
+!backend/requirements*.txt
+!backend/tests/
+!backend/tests/*.py
+!frontend/
+!frontend/**
+frontend/.env
+frontend/.env.*
+frontend/.git
+frontend/.nuxt
+frontend/.output
+frontend/.local
+frontend/node_modules
+frontend/coverage
+frontend/dist

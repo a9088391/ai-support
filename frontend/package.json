@@ -1,0 +1,20 @@
+{
+  "name": "ai-support-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^24.22.2"
+  },
+  "scripts": {
+    "format:check": "prettier --check app tests nuxt.config.ts package.json tsconfig.json",
+    "typecheck": "nuxt typecheck",
+    "generate": "nuxt generate"
+  },
+  "devDependencies": {
+    "nuxt": "4.6.4",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "vue-tsc": "3.3.14"
+  }
+}

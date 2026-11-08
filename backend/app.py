@@ -34,6 +34,7 @@ SEARCH_INVALID = "搜尋欄位格式不正確。"
 ANSWER_INVALID = "問題欄位格式不正確。"
 TICKET_INVALID = "工單欄位格式不正確。"
 TICKET_PAGE_INVALID = "工單分頁參數格式不正確。"
+TICKET_RESOLUTION_INVALID = "處理結果欄位格式不正確。"
 PURGE_INTERVAL_SECONDS = 240
 
 
@@ -353,7 +354,7 @@ def create_app(settings: Settings | None = None, static: Path = STATIC) -> FastA
             )
 
     @app.get("/api/tickets")
-    # 一般使用者與客服目前都只能看自己的工單，最多每頁 100 筆。
+    # 工單依登入角色決定可見範圍，最多每頁 100 筆。
     def list_tickets(request: Request) -> tickets.TicketPage:
         # 先驗證分頁形狀，不讓重複或不支援的參數影響查詢。
         digest = request_digest(request)
@@ -377,9 +378,9 @@ def create_app(settings: Settings | None = None, static: Path = STATIC) -> FastA
             )
 
     @app.get("/api/tickets/{ticket_id}")
-    # 工單明細使用不透明識別，並按目前工作階段的建立人篩選。
+    # 工單明細使用不透明識別，一般帳號只能讀自己的工單。
     def get_ticket(request: Request, ticket_id: str) -> tickets.TicketDetail:
-        # 畸形識別不回顯，與不存在或不屬於本人的識別共用 404。
+        # 畸形識別、工單不存在或目前角色無權查看時，都回傳同一個 404。
         digest = request_digest(request)
         try:
             identifier = parse_answer_id(ticket_id)
@@ -387,6 +388,30 @@ def create_app(settings: Settings | None = None, static: Path = STATIC) -> FastA
             raise HTTPException(status_code=404, detail=tickets.NOT_FOUND) from None
         with ticket_http_errors():
             return tickets.read_ticket(request.app.state.settings, digest, identifier)
+
+    @app.post("/api/tickets/{ticket_id}/close")
+    # 沿用同源與本文防護，只接收處理結果，識別由交易內的客服角色核對後才解析。
+    async def close_ticket(request: Request, ticket_id: str) -> tickets.TicketDetail:
+        # 只驗證本文形狀，回應不包含識別或收到的欄位。
+        digest = request_digest(request)
+        try:
+            form = tickets.ResolutionInput.model_validate(
+                await read_json(request, TICKET_RESOLUTION_INVALID)
+            )
+        except ValidationError:
+            raise HTTPException(
+                status_code=422, detail=TICKET_RESOLUTION_INVALID
+            ) from None
+
+        # 等待資料庫鎖時不阻塞事件迴圈，沿用工單共用的安全錯誤回應。
+        with ticket_http_errors():
+            return await run_in_threadpool(
+                tickets.close_ticket,
+                request.app.state.settings,
+                digest,
+                ticket_id,
+                form,
+            )
 
     @app.get("/health")
     # 提供不會接觸模型的本機存活檢查。

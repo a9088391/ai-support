@@ -5,6 +5,7 @@ export const INVALID_PLAIN_TEXT_CHARACTER =
   /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\ud800-\udfff]/u;
 export const BLANK_PLAIN_TEXT = /^[\p{Z}\t\n\r]*$/u;
 const MAX_ANSWER_SOURCES = 40;
+const MAX_TICKET_TEXT_CODE_POINTS = 4_000;
 const RESOURCE_ID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 
 export type Role = "user" | "support";
@@ -40,14 +41,16 @@ export interface AnswerOutput extends AnswerIdentity, AnswerEvidence {
 export interface TicketSummary {
   readonly id: string;
   readonly description: string;
+  readonly question: string;
   readonly created_at: string;
-  readonly status: "open";
+  readonly status: "open" | "closed";
+  readonly resolution: string | null;
+  readonly closed_at: string | null;
 }
 
 export interface TicketDetail extends TicketSummary, AnswerEvidence {
   readonly question_id: string;
   readonly attempt_id: string;
-  readonly question: string;
   readonly answer_status: AnswerStatus;
   readonly created_by: Role;
 }
@@ -210,18 +213,63 @@ export function readAnswerOutput(value: unknown): AnswerOutput | null {
   };
 }
 
-// 摘要只接收目前契約的識別、開啟狀態、純文字與可用時間。
-function isTicketSummary(value: unknown): value is TicketSummary {
-  const dto = asRecord(value);
+// 工單表單與結案讀回共用純文字規則，以碼位計數並保留原文。
+export function validateTicketText(
+  text: string,
+  field: "問題描述" | "處理結果",
+): string {
+  // 拒絕超限文字，保留合法的代理字元對與草稿。
+  if (
+    text.length > MAX_TICKET_TEXT_CODE_POINTS * 2 ||
+    Array.from(text).length > MAX_TICKET_TEXT_CODE_POINTS
+  ) {
+    return `${field}不可超過 4,000 個 Unicode 字元。`;
+  }
+
+  // 拒絕控制字元及未配對代理字元，保留允許的空白與換行。
+  if (INVALID_PLAIN_TEXT_CHARACTER.test(text)) {
+    return `${field}包含無法使用的字元，請修正後再送出。`;
+  }
+
+  // 純空白無法說明問題或結果；含有效內容時保留前後空白。
+  return BLANK_PLAIN_TEXT.test(text) ? `請輸入${field}。` : "";
+}
+
+// 工單建立與結案時間都須為可顯示的 UTC 時間。
+function isUtcTicketTime(value: unknown): value is string {
   // prettier-ignore
   return (
-    dto !== null
-    && isResourceId(dto.id)
-    && dto.status === "open"
-    && typeof dto.description === "string"
-    && typeof dto.created_at === "string"
-    && /(?:Z|\+00:00)$/.test(dto.created_at)
-    && Number.isFinite(Date.parse(dto.created_at))
+    typeof value === "string"
+    && /(?:Z|\+00:00)$/.test(value)
+    && Number.isFinite(Date.parse(value))
+  );
+}
+
+// 摘要須包含可用的識別、描述、原始問題與完整的狀態欄位。
+function isTicketSummary(value: unknown): value is TicketSummary {
+  // 清單與快照都先驗證不隨狀態變更的欄位。
+  const dto = asRecord(value);
+  // prettier-ignore
+  if (
+    !dto
+    || !isResourceId(dto.id)
+    || typeof dto.description !== "string"
+    || typeof dto.question !== "string"
+    || !isUtcTicketTime(dto.created_at)
+  ) {
+    return false;
+  }
+
+  // 開啟時兩欄皆空；結案時間與合法的處理結果才能證明已結案。
+  if (dto.status === "open") {
+    return dto.resolution === null && dto.closed_at === null;
+  }
+  // prettier-ignore
+  return (
+    dto.status === "closed"
+    && typeof dto.resolution === "string"
+    && validateTicketText(dto.resolution, "處理結果") === ""
+    && isUtcTicketTime(dto.closed_at)
   );
 }
 
@@ -244,12 +292,13 @@ export function readTicketPage(
   return { tickets: dto.tickets, has_more: dto.has_more };
 }
 
-// 快照只對當前登入者呈現，並保留原問題與獨立描述。
+// 建單回應限本人；僅工單查閱和結案明確開放客服讀取跨帳號快照。
 export function readTicketDetail(
   value: unknown,
   owner: Role,
+  scope: "own" | "visible" = "own",
 ): TicketDetail | null {
-  // 回應須同時包含基本工單資訊、來源識別與正確的建立人。
+  // 回應須包含基本工單資訊與來源識別，任何角色均拒絕未知建立人。
   const dto = asRecord(value);
   // prettier-ignore
   if (
@@ -257,9 +306,16 @@ export function readTicketDetail(
     || !isTicketSummary(dto)
     || !isResourceId(dto.question_id)
     || !isResourceId(dto.attempt_id)
-    || typeof dto.question !== "string"
     || typeof dto.answer_status !== "string"
-    || dto.created_by !== owner
+    || (dto.created_by !== "user" && dto.created_by !== "support")
+  ) {
+    return null;
+  }
+
+  // 只有明確採用查閱範圍的客服可看到另一帳號的工單。
+  if (
+    !(scope === "visible" && owner === "support") &&
+    dto.created_by !== owner
   ) {
     return null;
   }
@@ -274,11 +330,13 @@ export function readTicketDetail(
     description: dto.description,
     created_at: dto.created_at,
     status: dto.status,
+    resolution: dto.resolution,
+    closed_at: dto.closed_at,
     question_id: dto.question_id,
     attempt_id: dto.attempt_id,
     question: dto.question,
     answer_status: dto.answer_status as AnswerStatus,
-    created_by: owner,
+    created_by: dto.created_by,
     ...evidence,
   };
 }

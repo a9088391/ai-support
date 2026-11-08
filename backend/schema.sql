@@ -128,6 +128,11 @@ CREATE TABLE IF NOT EXISTS tickets (
 );
 CREATE INDEX IF NOT EXISTS tickets_by_owner ON tickets (created_by, created_at DESC, id DESC);
 
+-- 舊工單仍為 open，重跑初始化時保留已提交的結案結果與時間。
+ALTER TABLE tickets
+    ADD COLUMN IF NOT EXISTS resolution text,
+    ADD COLUMN IF NOT EXISTS closed_at timestamptz;
+
 -- 已核對的重送只保留識別，與工單同壽命，且不參照暫存問答。
 CREATE TABLE IF NOT EXISTS ticket_attempt_replays (
     ticket_id uuid NOT NULL REFERENCES tickets (id) ON DELETE CASCADE,

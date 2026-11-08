@@ -5,7 +5,10 @@ import {
   type TicketDetail,
 } from "~/workbench/contracts";
 
-defineProps<{ ticket: TicketDetail }>();
+defineProps<{
+  ticket: TicketDetail;
+  closeRecovery: "unknown" | "conflict" | null;
+}>();
 </script>
 
 <template>
@@ -20,7 +23,17 @@ defineProps<{ ticket: TicketDetail }>();
       </div>
       <div>
         <dt>工單狀態</dt>
-        <dd>開啟</dd>
+        <dd v-if="closeRecovery === 'conflict'">已結案，待讀取結果</dd>
+        <dd v-else-if="closeRecovery">待確認結案結果</dd>
+        <dd v-else>{{ ticket.status === "closed" ? "已結案" : "開啟" }}</dd>
+      </div>
+      <div v-if="ticket.closed_at">
+        <dt>結案時間</dt>
+        <dd>
+          <time :datetime="ticket.closed_at">{{
+            ticketTime(ticket.closed_at)
+          }}</time>
+        </dd>
       </div>
       <div>
         <dt>建立時間</dt>
@@ -42,6 +55,17 @@ defineProps<{ ticket: TicketDetail }>();
     >
       <h3 id="ticket-description-heading">問題描述</h3>
       <p class="answer-text">{{ ticket.description }}</p>
+    </section>
+
+    <slot />
+
+    <section
+      v-if="ticket.status === 'closed'"
+      class="knowledge-search-state"
+      aria-labelledby="ticket-resolution-heading"
+    >
+      <h3 id="ticket-resolution-heading">處理結果</h3>
+      <p class="answer-text">{{ ticket.resolution }}</p>
     </section>
 
     <section

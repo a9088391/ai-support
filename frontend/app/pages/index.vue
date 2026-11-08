@@ -18,6 +18,7 @@ import {
   readTicketPage,
   sameAnswerAttempt,
   ticketTime,
+  validateTicketText,
   type AnswerEvidence,
   type AnswerIdentity,
   type AnswerOutput,
@@ -33,7 +34,6 @@ const LOGOUT_UNCONFIRMED = "目前無法確認登出結果，請手動重試登�
 const MAX_KNOWLEDGE_QUERY_CODE_POINTS = 2_000;
 const MAX_QUESTION_CODE_POINTS = 2_000;
 const MAX_CONVERSATION_QUESTIONS = 10;
-const MAX_TICKET_DESCRIPTION_CODE_POINTS = 4_000;
 const TICKET_PAGE_SIZE = 20;
 const TICKET_WRITE_UNCONFIRMED =
   "目前無法確認建單結果，已保留問題描述。可先查看我的工單，或手動重送；若已建單，重送會讀回原工單。";
@@ -149,6 +149,12 @@ const ticketDescriptionInput = ref<HTMLTextAreaElement | null>(null);
 const ticketFormFeedback = ref<HTMLElement | null>(null);
 const ticketHeading = ref<HTMLElement | null>(null);
 const ticketReadFeedback = ref<HTMLElement | null>(null);
+const ticketResolution = ref("");
+const ticketResolutionInvalid = ref(false);
+const ticketCloseFeedback = ref("");
+const ticketCloseRecovery = ref<"unknown" | "conflict" | null>(null);
+const ticketResolutionInput = ref<HTMLTextAreaElement | null>(null);
+const ticketCloseFeedbackElement = ref<HTMLElement | null>(null);
 const usernameInput = ref<HTMLInputElement | null>(null);
 const passwordInput = ref<HTMLInputElement | null>(null);
 const knowledgeQueryInput = ref<HTMLInputElement | null>(null);
@@ -199,6 +205,14 @@ const roleDescription = computed(() =>
   identity.value?.role === "user"
     ? "此為您專屬的一般使用者工作區。"
     : "此工作區確認為客服角色，與一般使用者的個人工作區分開。",
+);
+// 同一套工單導航隨登入角色呈現資料範圍。
+const ticketListTitle = computed(() =>
+  identity.value?.role === "support" ? "全部工單" : "我的工單",
+);
+// 確認前留在原工單，避免離開畫面後遺失待核對的草稿。
+const isTicketNavigationLocked = computed(
+  () => ticketWrite.value !== null || ticketCloseRecovery.value !== null,
 );
 // 僅接受完整且符合固定模型契約的狀態回應，未知內容不得開放登入。
 function isSetupDto(value: unknown): value is SetupDto {
@@ -391,9 +405,16 @@ function finishOperation(operation: Operation): void {
 }
 
 // 等待 Vue 更新畫面後聚焦指定欄位或錯誤標題。
-function focus(target: { readonly value: HTMLElement | null }): void {
-  // 等待目標元素掛載後再移動鍵盤焦點。
-  void nextTick(() => target.value?.focus());
+function focus(
+  target: { readonly value: HTMLElement | null },
+  canFocus?: () => boolean,
+): void {
+  // 等待目標掛載，再確認畫面仍接受這次鍵盤焦點。
+  void nextTick(() => {
+    if (!canFocus || canFocus()) {
+      target.value?.focus();
+    }
+  });
 }
 
 // 啟用畫面優先聚焦待確認的登出，讓使用者能接續原操作。
@@ -1400,6 +1421,14 @@ function resetTicketEditor(): void {
   ticketDescriptionInvalid.value = false;
 }
 
+// 離開工單或帳號、或確認已結案後清除該張工單的私人草稿。
+function resetTicketResolution(): void {
+  ticketResolution.value = "";
+  ticketResolutionInvalid.value = false;
+  ticketCloseFeedback.value = "";
+  ticketCloseRecovery.value = null;
+}
+
 // 清除前一工作階段的表單、清單和快照，撤銷所有遲到回應的更新權。
 function clearTickets(): void {
   // 先撤銷目前操作，再取消讀寫傳輸；取消 POST 不能推定未提交。
@@ -1412,6 +1441,7 @@ function clearTickets(): void {
 
   // 同一頁返回也不展示舊帳號的資料或草稿。
   resetTicketEditor();
+  resetTicketResolution();
   ticketView.value = "workbench";
   ticketPage.value = null;
   ticketDetail.value = null;
@@ -1469,23 +1499,6 @@ function handleTicketDescriptionInput(): void {
     ticketDescriptionInvalid.value = false;
     ticketFormError.value = "";
   }
-}
-
-// 與後端共用純文字規則；使用碼位而非 textarea 的 UTF-16 上限。
-function validateTicketDescription(description: string): string {
-  // 拒絕超限文字，不能自動截斷有效的代理字元對或草稿。
-  if (
-    description.length > MAX_TICKET_DESCRIPTION_CODE_POINTS * 2 ||
-    Array.from(description).length > MAX_TICKET_DESCRIPTION_CODE_POINTS
-  ) {
-    return "問題描述不可超過 4,000 個 Unicode 字元。";
-  }
-
-  // 拒絕控制字元及未配對代理字元，保留允許的空白與換行。
-  if (INVALID_PLAIN_TEXT_CHARACTER.test(description)) {
-    return "問題描述包含無法使用的字元，請修正後再送出。";
-  }
-  return BLANK_PLAIN_TEXT.test(description) ? "請輸入問題描述。" : "";
 }
 
 // 讀取和寫入各持有自己的更新權，回讀後仍要核對原登入身分。
@@ -1594,7 +1607,7 @@ async function submitTicket(): Promise<void> {
 
   // 使用者修正或重試前保留實際文字，不去除原本的空白。
   const description = ticketDescription.value;
-  ticketFormError.value = validateTicketDescription(description);
+  ticketFormError.value = validateTicketText(description, "問題描述");
   ticketDescriptionInvalid.value = !!ticketFormError.value;
   if (ticketDescriptionInvalid.value) {
     focus(ticketDescriptionInput);
@@ -1670,18 +1683,205 @@ async function submitTicket(): Promise<void> {
   }
 }
 
+// 更正結案欄位只解除欄位錯誤，確認狀態的回饋由讀取結果決定。
+function handleTicketResolutionInput(): void {
+  if (ticketResolutionInvalid.value) {
+    ticketResolutionInvalid.value = false;
+    ticketCloseFeedback.value = "";
+  }
+}
+
+// 結案送出和讀回共用明確的登入、權限與資源失效處理。
+function handleTicketCloseAccess(status: number | null): boolean {
+  // 無法再確認原帳號可操作時，撤銷舊身分的私有畫面和草稿。
+  if (status === 401 || status === 403) {
+    expireWorkbenchSession(
+      status === 401
+        ? "登入工作階段已失效，請重新登入後查看工單。"
+        : "無法驗證客服權限或要求來源，請重新登入後查看工單。",
+    );
+    return false;
+  }
+
+  // 目標已不可見，只保留安全的讀取錯誤與既有重查入口。
+  if (status === 404) {
+    resetTicketResolution();
+    ticketDetail.value = null;
+    ticketReadError.value = ticketFailureMessage(status, false);
+    return false;
+  }
+  return true;
+}
+
+// 提交或讀回已確認結案後，一併替換快照、清除草稿並顯示各自的回饋。
+function publishClosedTicket(ticket: TicketDetail, message: string): void {
+  resetTicketResolution();
+  ticketDetail.value = ticket;
+  ticketCloseFeedback.value = message;
+}
+
+// 客服明確送出一次結案，未知結果及競爭衝突僅能讀回原工單。
+async function settleTicketClose(checkOnly = false): Promise<void> {
+  // 讀回與提交都鎖定當前開啟中的詳情、客服身分及尚未占用的寫入權。
+  const owner = identity.value;
+  const detail = ticketDetail.value;
+  // prettier-ignore
+  if (
+    owner?.role !== "support"
+    || !isServiceReady.value
+    || ticketView.value !== "detail"
+    || detail?.status !== "open"
+    || ticketDetailId.value !== detail.id
+    || ticketWrite.value
+    || checkOnly !== (ticketCloseRecovery.value !== null)
+  ) {
+    return;
+  }
+  const id = detail.id;
+  const path = `/api/tickets/${id}`;
+  const resolution = ticketResolution.value;
+
+  // 僅提交時驗證草稿；確認結果只查詢工單，不編輯原文也不重送。
+  if (!checkOnly) {
+    ticketCloseFeedback.value = validateTicketText(resolution, "處理結果");
+    ticketResolutionInvalid.value = !!ticketCloseFeedback.value;
+    if (ticketResolutionInvalid.value) {
+      ticketResolutionInput.value?.focus();
+      return;
+    }
+  }
+
+  // 同步占用寫入權，阻擋連按並讓同一次取消權涵蓋後續讀回。
+  const operation: Operation = {
+    controller: new AbortController(),
+    foregroundEpoch: null,
+  };
+  ticketWrite.value = operation;
+  ticketCloseFeedback.value = "";
+  // 每次等待後都驗證原畫面、工單和工作階段，避免遲到結果或焦點跨頁。
+  const ownsClose = () =>
+    isCurrentTicket(operation, owner, ticketWrite.value) &&
+    ticketView.value === "detail" &&
+    ticketDetailId.value === id;
+  try {
+    if (!checkOnly) {
+      // 異動本文只有原樣的處理結果，與其他表單沿用同源及 CSRF 防護。
+      const result = await requestApi(`${path}/close`, operation, {
+        method: "POST",
+        body: { resolution },
+        headers: { "X-CSRF-Protection": "1" },
+      });
+      if (!ownsClose()) {
+        return;
+      }
+
+      // 確認拒絕時使用既有登入及讀取復原流程，避免展示失效的資料。
+      if (!handleTicketCloseAccess(result.status)) {
+        return;
+      }
+      // 欄位被後端明確拒絕時可直接更正，不需要查詢結案結果。
+      if (result.status === 422) {
+        ticketResolutionInvalid.value = true;
+        ticketCloseFeedback.value = "處理結果未通過格式檢查，請修正後再送出。";
+        return;
+      }
+
+      // 只採用此次工單已保存的結果；其餘回應都先查詢持久狀態。
+      const saved =
+        result.status === 200
+          ? readTicketDetail(result.data, owner.username, "visible")
+          : null;
+      // prettier-ignore
+      if (
+        saved?.id === id
+        && saved.status === "closed"
+        && saved.resolution === resolution
+      ) {
+        publishClosedTicket(saved, "已結案，處理結果已儲存。");
+        return;
+      }
+      // 409 已確認結案；其他未確認回應仍可能已提交，都要讀回有效結果。
+      ticketCloseRecovery.value =
+        result.status === 409 ? "conflict" : "unknown";
+      if (result.status === 503) {
+        // 服務仍可用才讀工單；失去啟用或登入會撤銷目前畫面的更新權。
+        await recheckBusinessSetup();
+        if (!ownsClose()) {
+          return;
+        }
+      }
+    }
+
+    // 無法從異動回應判斷結果時，只讀原工單一次。
+    const result = await requestApi(path, operation, { method: "GET" });
+    if (!ownsClose() || !handleTicketCloseAccess(result.status)) {
+      return;
+    }
+
+    // 讀回的 503 也可能是啟用失效；仍啟用才保留草稿及手動確認入口。
+    if (result.status === 503) {
+      await recheckBusinessSetup();
+      if (!ownsClose()) {
+        return;
+      }
+    }
+
+    // 已結案永遠顯示資料庫中的勝出結果，不以本次草稿覆蓋。
+    const saved =
+      result.status === 200
+        ? readTicketDetail(result.data, owner.username, "visible")
+        : null;
+    const conflict = ticketCloseRecovery.value === "conflict";
+    if (saved?.id === id && saved.status === "closed") {
+      publishClosedTicket(
+        saved,
+        conflict
+          ? "這張工單已經結案，以下顯示已儲存的處理結果。"
+          : "已確認這張工單結案，以下顯示已儲存的處理結果。",
+      );
+      return;
+    }
+
+    // 只有確定工單仍開啟且未收到結案衝突，才恢復手動提交。
+    if (saved?.id === id && saved.status === "open" && !conflict) {
+      ticketDetail.value = saved;
+      ticketCloseRecovery.value = null;
+      ticketCloseFeedback.value =
+        "工單仍開啟。已保留處理結果，您可以再次手動結案。";
+      return;
+    }
+    ticketCloseFeedback.value = conflict
+      ? "工單已結案，目前無法讀取處理結果。已保留草稿，請再次確認結案結果。"
+      : "目前無法確認結案結果。已保留草稿，請先確認結案結果。";
+  } finally {
+    // 畫面完成更新後才聚焦，並在交還操作權前再次核對擁有者。
+    if (ownsClose()) {
+      await nextTick();
+      if (ownsClose()) {
+        const feedbackTarget = ticketResolutionInvalid.value
+          ? ticketResolutionInput.value
+          : (ticketReadFeedback.value ?? ticketCloseFeedbackElement.value);
+        feedbackTarget?.focus();
+      }
+    }
+    if (ticketWrite.value === operation) {
+      ticketWrite.value = null;
+    }
+  }
+}
+
 // 清單或詳情使用獨立的讀取擁有權，切換時取消舊請求及清空舊資料。
 async function loadTickets(
   id: string | null,
   offset = ticketOffset.value,
 ): Promise<void> {
-  // 保留未提交或未知結果的草稿；只有正在寫入時暫停導航。
+  // 寫入中或結案結果待確認時暫停導航；明確切換時會清除結案草稿，保留建單草稿。
   const owner = identity.value;
   // prettier-ignore
   if (
     !owner
     || !isServiceReady.value
-    || ticketWrite.value
+    || isTicketNavigationLocked.value
   ) {
     return;
   }
@@ -1693,14 +1893,26 @@ async function loadTickets(
     foregroundEpoch: null,
   };
   ticketRead.value = operation;
+  resetTicketResolution();
   ticketOffset.value = offset;
   ticketDetailId.value = id;
   ticketDetail.value = null;
   ticketPage.value = null;
   ticketReadError.value = "";
   ticketCreated.value = false;
-  ticketView.value = id ? "detail" : "list";
-  focus(ticketHeading);
+  const view = id ? "detail" : "list";
+  ticketView.value = view;
+
+  // 切換分頁或詳情時，前一次讀取不能更新目前內容或搶走焦點。
+  // prettier-ignore
+  const ownsView = () =>
+    ticketView.value === view
+    && ticketDetailId.value === id
+    && ticketOffset.value === offset;
+  // 只接受同一個讀取操作且登入身分、服務和畫面仍有效的結果。
+  const ownsRead = () =>
+    isCurrentTicket(operation, owner, ticketRead.value) && ownsView();
+  focus(ticketHeading, ownsRead);
 
   try {
     // 列表只讀指定的一頁；明細依已驗證的工單識別定位。
@@ -1708,7 +1920,7 @@ async function loadTickets(
       ? `/api/tickets/${id}`
       : `/api/tickets?limit=${TICKET_PAGE_SIZE}&offset=${offset}`;
     const result = await requestApi(path, operation, { method: "GET" });
-    if (!isCurrentTicket(operation, owner, ticketRead.value)) {
+    if (!ownsRead()) {
       return;
     }
 
@@ -1719,7 +1931,7 @@ async function loadTickets(
     }
     if (result.status === 503) {
       await recheckBusinessSetup();
-      if (!isCurrentTicket(operation, owner, ticketRead.value)) {
+      if (!ownsRead()) {
         return;
       }
     }
@@ -1727,29 +1939,31 @@ async function loadTickets(
     // 僅採用合法分頁，或符合本次識別與登入者的快照。
     if (result.status === 200) {
       if (id) {
-        const detail = readTicketDetail(result.data, owner.username);
+        const detail = readTicketDetail(result.data, owner.username, "visible");
         if (detail?.id === id) {
-          // 只有同題、同嘗試的快照能確認先前結果未知的送出。
-          reconcileTicketSnapshot(detail);
-          const editor = ticketEditor.value;
-          const submittedDescription = unconfirmedTicketDescription;
-          // prettier-ignore
-          if (
-            submittedDescription !== null
-            && editor?.source.question_id === detail.question_id
-            && editor.source.attempt_id === detail.attempt_id
-          ) {
-            unconfirmedTicketDescription = null;
+          // 跨帳號快照只供檢視，本人快照才可確認同一次問答或建單。
+          if (detail.created_by === owner.username) {
+            reconcileTicketSnapshot(detail);
+            const editor = ticketEditor.value;
+            const submittedDescription = unconfirmedTicketDescription;
+            // prettier-ignore
+            if (
+              submittedDescription !== null
+              && editor?.source.question_id === detail.question_id
+              && editor.source.attempt_id === detail.attempt_id
+            ) {
+              unconfirmedTicketDescription = null;
 
-            // 只收起已保存且未再編輯的草稿，保留後續的編輯及拒絕回饋。
-            if (ticketFormError.value === TICKET_WRITE_UNCONFIRMED) {
-              if (
-                ticketDescription.value === submittedDescription &&
-                detail.description === submittedDescription
-              ) {
-                resetTicketEditor();
-              } else {
-                ticketFormError.value = "";
+              // 只收起已保存且未再編輯的草稿，保留後續的編輯及拒絕回饋。
+              if (ticketFormError.value === TICKET_WRITE_UNCONFIRMED) {
+                if (
+                  ticketDescription.value === submittedDescription &&
+                  detail.description === submittedDescription
+                ) {
+                  resetTicketEditor();
+                } else {
+                  ticketFormError.value = "";
+                }
               }
             }
           }
@@ -1767,7 +1981,16 @@ async function loadTickets(
 
     // 原導航仍有效時才顯示讀取失敗與手動重試。
     ticketReadError.value = ticketFailureMessage(result.status, false);
-    focus(ticketReadFeedback);
+    focus(
+      ticketReadFeedback,
+      // 讀取結束才顯示錯誤；若期間有新的導航或換帳號，焦點留在新畫面。
+      // prettier-ignore
+      () =>
+        ticketRead.value === null
+        && identity.value === owner
+        && isServiceReady.value
+        && ownsView(),
+    );
   } finally {
     // 只釋放這次讀取；返回工作台或換頁不等待舊讀取完成。
     if (ticketRead.value === operation) {
@@ -1778,7 +2001,7 @@ async function loadTickets(
 
 // 回到問答及搜尋，保留本頁對話與尚待確認的建單描述。
 function showWorkbench(): void {
-  if (ticketWrite.value || ticketView.value === "workbench") {
+  if (isTicketNavigationLocked.value || ticketView.value === "workbench") {
     return;
   }
   // 先釋放讀取擁有權，避免遲到錯誤把焦點帶回隱藏的工單區。
@@ -1789,6 +2012,7 @@ function showWorkbench(): void {
   ticketDetail.value = null;
   ticketDetailId.value = null;
   ticketReadError.value = "";
+  resetTicketResolution();
   ticketView.value = "workbench";
   focus(ticketEditor.value ? ticketDescriptionInput : workbenchHeading);
 }
@@ -2109,7 +2333,7 @@ onBeforeUnmount(() => {
             type="button"
             class="workbench-nav-action"
             :aria-current="ticketView === 'workbench' ? 'page' : undefined"
-            :disabled="ticketWrite !== null"
+            :disabled="isTicketNavigationLocked"
             @click="showWorkbench"
           >
             工作台
@@ -2118,10 +2342,10 @@ onBeforeUnmount(() => {
             type="button"
             class="workbench-nav-action"
             :aria-current="ticketView !== 'workbench' ? 'page' : undefined"
-            :disabled="ticketWrite !== null"
+            :disabled="isTicketNavigationLocked"
             @click="loadTickets(null, 0)"
           >
-            我的工單
+            {{ ticketListTitle }}
           </button>
         </nav>
 
@@ -2355,7 +2579,7 @@ onBeforeUnmount(() => {
                   :disabled="ticketWrite !== null"
                   @click="loadTickets(null, 0)"
                 >
-                  查看我的工單
+                  查看{{ ticketListTitle }}
                 </button>
               </div>
             </form>
@@ -2548,15 +2772,16 @@ onBeforeUnmount(() => {
         >
           <p class="eyebrow">工單</p>
           <h2 id="ticket-title" ref="ticketHeading" tabindex="-1">
-            {{ ticketView === "list" ? "我的工單" : "工單詳情" }}
+            {{ ticketView === "list" ? ticketListTitle : "工單詳情" }}
           </h2>
           <button
             v-if="ticketView === 'detail'"
             type="button"
             class="answer-secondary-action"
+            :disabled="isTicketNavigationLocked"
             @click="loadTickets(null)"
           >
-            返回我的工單
+            返回{{ ticketListTitle }}
           </button>
 
           <p v-if="ticketRead" class="knowledge-search-state" role="status">
@@ -2569,6 +2794,7 @@ onBeforeUnmount(() => {
             <button
               type="button"
               class="answer-secondary-action"
+              :disabled="isTicketNavigationLocked"
               @click="loadTickets(ticketDetailId)"
             >
               重試讀取
@@ -2581,19 +2807,24 @@ onBeforeUnmount(() => {
               class="knowledge-search-state"
               role="status"
             >
-              {{
-                ticketOffset
-                  ? "這一頁沒有工單。"
-                  : "目前沒有工單。您可以從問答卡建立工單。"
-              }}
+              {{ ticketOffset > 0 ? "這一頁沒有工單。" : "目前沒有工單。" }}
+              <template v-if="ticketOffset === 0 && identity.role === 'user'">
+                您可以從問答卡建立工單。
+              </template>
             </p>
-            <ul v-else class="ticket-list" aria-label="我的工單列表">
+            <ul
+              v-else
+              class="ticket-list"
+              :aria-label="`${ticketListTitle}列表`"
+            >
               <li
                 v-for="ticket in ticketPage.tickets"
                 :key="ticket.id"
                 class="knowledge-search-state"
               >
-                <p class="ticket-summary-text">{{ ticket.description }}</p>
+                <p class="ticket-summary-text answer-text">
+                  {{ ticket.description }}
+                </p>
                 <dl class="knowledge-result-details">
                   <div>
                     <dt>工單編號</dt>
@@ -2603,7 +2834,29 @@ onBeforeUnmount(() => {
                   </div>
                   <div>
                     <dt>工單狀態</dt>
-                    <dd>開啟</dd>
+                    <dd>
+                      {{ ticket.status === "closed" ? "已結案" : "開啟" }}
+                    </dd>
+                  </div>
+                  <div v-if="ticket.closed_at">
+                    <dt>結案時間</dt>
+                    <dd>
+                      <time :datetime="ticket.closed_at">{{
+                        ticketTime(ticket.closed_at)
+                      }}</time>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>原始問題</dt>
+                    <dd class="ticket-summary-preview answer-text">
+                      {{ ticket.question.trimStart() }}
+                    </dd>
+                  </div>
+                  <div v-if="ticket.status === 'closed'">
+                    <dt>處理結果</dt>
+                    <dd class="ticket-summary-preview answer-text">
+                      {{ ticket.resolution?.trimStart() }}
+                    </dd>
                   </div>
                   <div>
                     <dt>建立時間</dt>
@@ -2656,7 +2909,91 @@ onBeforeUnmount(() => {
             >
               已儲存工單；同一問題再次送出會保留原工單和原描述。
             </p>
-            <TicketSnapshot :ticket="ticketDetail" />
+            <TicketSnapshot
+              :ticket="ticketDetail"
+              :close-recovery="ticketCloseRecovery"
+            >
+              <p
+                v-if="ticketCloseFeedback"
+                id="ticket-close-feedback"
+                ref="ticketCloseFeedbackElement"
+                :class="
+                  ticketResolutionInvalid || ticketCloseRecovery
+                    ? 'knowledge-search-feedback'
+                    : 'knowledge-search-state'
+                "
+                :role="
+                  ticketResolutionInvalid || ticketCloseRecovery
+                    ? 'alert'
+                    : 'status'
+                "
+                tabindex="-1"
+              >
+                {{ ticketCloseFeedback }}
+              </p>
+              <p
+                v-else-if="ticketWrite"
+                class="knowledge-search-state"
+                role="status"
+              >
+                正在確認結案結果，請稍候。
+              </p>
+              <form
+                v-if="
+                  identity.role === 'support' && ticketDetail.status === 'open'
+                "
+                class="login-form answer-form"
+                aria-label="工單結案"
+                novalidate
+                :aria-busy="ticketWrite !== null"
+                @submit.prevent="settleTicketClose()"
+              >
+                <div
+                  v-if="ticketCloseRecovery !== 'conflict'"
+                  class="field-group"
+                >
+                  <label for="ticket-resolution">處理結果</label>
+                  <textarea
+                    id="ticket-resolution"
+                    ref="ticketResolutionInput"
+                    v-model="ticketResolution"
+                    name="resolution"
+                    rows="5"
+                    required
+                    autocomplete="off"
+                    :readonly="isTicketNavigationLocked"
+                    :aria-invalid="ticketResolutionInvalid ? 'true' : undefined"
+                    :aria-describedby="
+                      ticketCloseFeedback
+                        ? 'ticket-resolution-help ticket-close-feedback'
+                        : 'ticket-resolution-help'
+                    "
+                    @input="handleTicketResolutionInput"
+                  ></textarea>
+                  <p id="ticket-resolution-help" class="knowledge-search-help">
+                    最多 4,000 個 Unicode
+                    字元。結案後無法修改處理結果或重新開啟工單。
+                  </p>
+                </div>
+                <button
+                  v-if="ticketCloseRecovery"
+                  type="button"
+                  class="answer-secondary-action"
+                  :disabled="ticketWrite !== null"
+                  @click="settleTicketClose(true)"
+                >
+                  確認結案結果
+                </button>
+                <button
+                  v-else
+                  type="submit"
+                  class="primary-action"
+                  :disabled="ticketWrite !== null"
+                >
+                  結案
+                </button>
+              </form>
+            </TicketSnapshot>
           </template>
         </section>
 

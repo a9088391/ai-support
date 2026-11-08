@@ -1,9 +1,10 @@
 import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from operator import itemgetter
 from threading import Barrier, Event
+from time import monotonic
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -42,6 +43,15 @@ from fastapi.testclient import TestClient
 from starlette.types import Message, Scope
 
 TICKETS = "/api/tickets"
+TICKET_SUMMARY_FIELDS = (
+    "id",
+    "description",
+    "question",
+    "created_at",
+    "status",
+    "resolution",
+    "closed_at",
+)
 
 
 # 用實際已回答的問題建單，分別核對可編輯描述與可信回答和來源。
@@ -77,6 +87,8 @@ def test_ticket_snapshots_completed_answer(
             "created_at": ticket["created_at"],
             "created_by": "user",
             "status": "open",
+            "resolution": None,
+            "closed_at": None,
             "description": description,
             "question": QUESTION,
             "answer_status": "answered",
@@ -134,7 +146,7 @@ def test_ticket_http_rejects_invalid_input_and_other_owners(
         assert browser.post(TICKETS, json=form).status_code == 403
         assert browser.get(TICKETS).json() == {"tickets": [], "has_more": False}
 
-        # 正好 4000 個 Unicode 字元不截斷；客服也只能查自己的工單。
+        # 正好 4000 個 Unicode 字元不截斷；客服可看快照但不能代替原建立人重送。
         created = browser.post(TICKETS, headers=headers, content=raw)
         assert created.status_code == 200
         ticket = created.json()
@@ -142,11 +154,11 @@ def test_ticket_http_rejects_invalid_input_and_other_owners(
         detail = f"{TICKETS}/{ticket['id']}"
         assert other.get(detail).status_code == 401
         login(other, SUPPORT_FORM)
-        assert other.get(TICKETS).json() == {"tickets": [], "has_more": False}
-        assert other.get(detail).status_code == 404
+        assert other.get(detail).json() == ticket
         assert other.post(TICKETS, headers=CSRF, json=form).status_code == 404
         assert (
-            browser.get(f"{TICKETS}/private-marker").json() == other.get(detail).json()
+            browser.get(f"{TICKETS}/private-marker").json()
+            == other.get(f"{TICKETS}/{uuid4()}").json()
         )
         assert (
             browser.post(
@@ -160,6 +172,305 @@ def test_ticket_http_rejects_invalid_input_and_other_owners(
         assert browser.get(TICKETS).status_code == 503
         assert browser.get(detail).status_code == 503
         assert browser.post(TICKETS, headers=CSRF, json=form).status_code == 503
+
+
+# 驗證客服分頁包含兩個帳號的工單，查閱範圍只擴及快照。
+def test_ticket_visibility_and_pagination_use_the_session_role(
+    answer_ready: Settings, provider_script: ProviderScript, clock: list[datetime]
+) -> None:
+    # 兩個角色各自從 HTTP 問答建單，另保留一題一般帳號的未轉單問答。
+    provider_script.responses.extend([model_output(None, []) for _ in range(3)])
+    app = create_app(answer_ready)
+    with (
+        TestClient(app, base_url=ORIGIN) as browser,
+        TestClient(app, base_url=ORIGIN) as support,
+    ):
+        login(browser)
+        login(support, SUPPORT_FORM)
+        form = ticket_form(ask(browser), "一般帳號工單")
+        original = browser.post(TICKETS, headers=CSRF, json=form)
+        assert original.status_code == 200
+        user_ticket = original.json()
+        unconverted = ticket_form(ask(browser), "尚未轉單")
+        clock[0] += timedelta(seconds=1)
+        created = support.post(
+            TICKETS, headers=CSRF, json=ticket_form(ask(support), "客服工單")
+        )
+        assert created.status_code == 200
+        support_ticket = created.json()
+
+        # 核對客服兩頁的確切成員與順序，以及一般帳號的可見分頁邊界。
+        support_summary = {key: support_ticket[key] for key in TICKET_SUMMARY_FIELDS}
+        user_summary = {key: user_ticket[key] for key in TICKET_SUMMARY_FIELDS}
+        assert support.get(f"{TICKETS}?limit=1").json() == {
+            "tickets": [support_summary],
+            "has_more": True,
+        }
+        other_page = support.get(f"{TICKETS}?limit=1&offset=1").json()
+
+        # 客服清單的證據取自原始問題，與提單者編輯的描述分開。
+        row = other_page["tickets"][0]
+        assert (row.get("question"), row["description"]) == (QUESTION, "一般帳號工單")
+        assert other_page == {
+            "tickets": [user_summary],
+            "has_more": False,
+        }
+        assert browser.get(f"{TICKETS}?limit=1").json() == {
+            "tickets": [user_summary],
+            "has_more": False,
+        }
+        assert browser.get(f"{TICKETS}?limit=1&offset=1").json() == {
+            "tickets": [],
+            "has_more": False,
+        }
+        assert support.get(f"{TICKETS}/{user_ticket['id']}").json() == user_ticket
+        assert support.get(f"{TICKETS}/{support_ticket['id']}").json() == support_ticket
+        other = browser.get(f"{TICKETS}/{support_ticket['id']}")
+        absent = browser.get(f"{TICKETS}/{uuid4()}")
+        assert other.status_code == absent.status_code == 404
+        assert other.json() == absent.json()
+
+        # 快照可見也不能拿它讀取原問答、重送他人已建工單或替未轉單問答建單。
+        for source in (form, unconverted):
+            assert support.get(f"{ANSWERS}/{source['attempt_id']}").status_code == 404
+            assert support.post(TICKETS, headers=CSRF, json=source).status_code == 404
+
+
+# 結案只接受客服與有效的純文字輸入，成功後提單者能看到完整處理結果。
+def test_ticket_close_http_permissions_and_resolution_limits(
+    answer_ready: Settings, provider_script: ProviderScript, clock: list[datetime]
+) -> None:
+    # 由一般帳號建立工單，保留未結案快照供後續比較。
+    provider_script.responses.append(model_output(None, []))
+    app = create_app(answer_ready)
+    with (
+        TestClient(app, base_url=ORIGIN) as browser,
+        TestClient(app, base_url=ORIGIN) as support,
+    ):
+        login(browser)
+        form = ticket_form(ask(browser), "原始描述")
+        created = browser.post(TICKETS, headers=CSRF, json=form)
+        assert created.status_code == 200
+        ticket = created.json()
+        detail = f"{TICKETS}/{ticket['id']}"
+        close = f"{detail}/close"
+        unknown = f"{TICKETS}/{uuid4()}/close"
+        malformed = f"{TICKETS}/private-marker/close"
+        text = "🙂" * 3998 + " \n"
+        valid = {"resolution": text}
+
+        # 登入、角色、CSRF 與識別的拒絕不洩漏目標是否存在或含有哪些私人欄位。
+        assert support.post(close, headers=CSRF, json=valid).status_code == 401
+        forbidden = browser.post(close, headers=CSRF, json=valid)
+        assert forbidden.status_code == 403
+        for path in (unknown, malformed):
+            denied = browser.post(path, headers=CSRF, json=valid)
+            assert denied.status_code == 403
+            assert denied.json() == forbidden.json()
+        login(support, SUPPORT_FORM)
+        assert support.post(close, json=valid).status_code == 403
+        missing = support.post(unknown, headers=CSRF, json=valid)
+        assert missing.status_code == 404
+        bad_id = support.post(malformed, headers=CSRF, json=valid)
+        assert bad_id.status_code == 404
+        assert bad_id.json() == missing.json()
+
+        # 送出原始本文以保留重複鍵與不完整 JSON，並驗證 Unicode 字元界線。
+        headers = {**CSRF, "Content-Type": "application/json"}
+        raw = json.dumps(valid, ensure_ascii=False).encode("utf-8")
+        oversized = json.dumps({"resolution": "🙂" + text}, ensure_ascii=False).encode(
+            "utf-8"
+        )
+        assert len(text) == 4000 and "🙂".encode("utf-8") * 3998 in raw
+        assert "🙂".encode("utf-8") * 3999 in oversized
+        invalid_bodies = (
+            raw[:-1],
+            raw[:-1] + b', "resolution": "private-marker"}',
+            json.dumps({**valid, "status": "closed"}).encode(),
+            json.dumps({"resolution": "　\n"}).encode(),
+            oversized,
+            b'{"resolution":1}',
+            b"{}",
+        )
+        for invalid in invalid_bodies:
+            denied = support.post(close, headers=headers, content=invalid)
+            assert denied.status_code == 422
+            assert denied.json() == {"detail": "處理結果欄位格式不正確。"}
+        invalid_probe = browser.post(malformed, headers=headers, content=b"{}")
+        assert invalid_probe.status_code == 422
+        assert invalid_probe.json() == denied.json()
+        assert support.get(detail).json() == ticket
+
+        # 正好 4000 字元保留原樣，狀態與時間在本人及客服的讀取回應一致。
+        closed = support.post(close, headers=headers, content=raw)
+        assert closed.status_code == 200
+        saved = closed.json()
+        closed_at = datetime.fromisoformat(saved["closed_at"])
+        assert closed_at == clock[0] and closed_at.tzinfo == UTC
+        assert saved == {
+            **ticket,
+            "status": "closed",
+            "closed_at": saved["closed_at"],
+            "resolution": text,
+        }
+        for client in (browser, support):
+            assert client.get(detail).json() == saved
+            assert client.get(TICKETS).json() == {
+                "tickets": [{key: saved[key] for key in TICKET_SUMMARY_FIELDS}],
+                "has_more": False,
+            }
+
+        # 失去啟用資格後，既有客服登入也不能異動工單。
+        answer_ready.key_file.unlink()
+        assert support.post(close, headers=CSRF, json=valid).status_code == 503
+
+
+# 兩個獨立客服 Session 競爭同一張工單時，只保留勝出的結果及原快照。
+def test_ticket_concurrent_closes_preserve_first_result(
+    answer_ready: Settings, provider_script: ProviderScript
+) -> None:
+    # 由一般帳號建立快照，再開啟兩個獨立的客服登入。
+    provider_script.responses.append(model_output(None, []))
+    app = create_app(answer_ready)
+    with (
+        TestClient(app, base_url=ORIGIN) as browser,
+        TestClient(app, base_url=ORIGIN) as first,
+        TestClient(app, base_url=ORIGIN) as second,
+    ):
+        login(browser)
+        assert login(first, SUPPORT_FORM) != login(second, SUPPORT_FORM)
+        form = ticket_form(ask(browser), "原始描述")
+        original = browser.post(TICKETS, headers=CSRF, json=form)
+        assert original.status_code == 200
+        ticket = original.json()
+        detail = f"{TICKETS}/{ticket['id']}"
+        close = f"{detail}/close"
+        resolutions = ("處理結果一", "處理結果二")
+
+        # 用資料庫列鎖保留兩個等待中的結案，觀察確實重疊後才放行。
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            with answer_ready.connect() as blocker, answer_ready.connect() as observer:
+                blocker.execute(
+                    "SELECT id FROM tickets WHERE id = %s FOR NO KEY UPDATE",
+                    (ticket["id"],),
+                )
+                observer.autocommit = True
+                # 各自送出不同結果，讓兩筆獨立請求都等在工單鎖上。
+                requests = [
+                    executor.submit(
+                        client.post,
+                        close,
+                        headers=CSRF,
+                        json={"resolution": resolution},
+                    )
+                    for client, resolution in zip(
+                        (first, second), resolutions, strict=True
+                    )
+                ]
+                deadline = monotonic() + 2
+                while observer.execute(
+                    """
+                    SELECT count(*) FROM pg_stat_activity
+                    WHERE datname = current_database() AND wait_event_type = 'Lock'
+                      AND query LIKE '%tickets%' AND cardinality(pg_blocking_pids(pid)) > 0
+                    """
+                ).fetchone() != (2,):
+                    assert monotonic() < deadline
+            responses = [pending.result(timeout=5) for pending in requests]
+
+        # 勝出回應必須符合該次輸入；衝突回應不得帶出任一處理結果。
+        codes = [response.status_code for response in responses]
+        assert sorted(codes) == [200, 409]
+        winner = responses[codes.index(200)].json()
+        conflict = responses[codes.index(409)]
+        assert all(resolution not in conflict.text for resolution in resolutions)
+        assert winner == {
+            **ticket,
+            "status": "closed",
+            "resolution": resolutions[codes.index(200)],
+            "closed_at": winner["closed_at"],
+        }
+        assert datetime.fromisoformat(winner["closed_at"]).tzinfo == UTC
+
+        # 重複結案仍衝突，原次建單重送則只讀回已保存的快照及結案結果。
+        repeat = first.post(close, headers=CSRF, json={"resolution": "不應覆寫"})
+        assert repeat.status_code == 409 and repeat.json() == conflict.json()
+        assert browser.get(detail).json() == winner
+        replay = browser.post(
+            TICKETS, headers=CSRF, json={**form, "description": "重送"}
+        )
+        assert replay.status_code == 200 and replay.json() == winner
+
+
+@pytest.mark.parametrize(
+    ("block_write", "expire_session"), [(False, True), (True, True), (True, False)]
+)
+# 等待讀取或寫入期間若失去授權，拒絕結案並保留原工單。
+def test_ticket_close_rechecks_authorization_after_waiting(
+    answer_ready: Settings,
+    provider_script: ProviderScript,
+    clock: list[datetime],
+    block_write: bool,
+    expire_session: bool,
+) -> None:
+    # 建單後登出一般帳號，只讓客服的 Session 接近絕對期限。
+    provider_script.responses.append(model_output(None, []))
+    app = create_app(answer_ready)
+    with (
+        TestClient(app, base_url=ORIGIN) as browser,
+        TestClient(app, base_url=ORIGIN) as support,
+    ):
+        login(browser)
+        created = browser.post(
+            TICKETS, headers=CSRF, json=ticket_form(ask(browser), "原始描述")
+        )
+        assert created.status_code == 200
+        ticket = created.json()
+        detail = f"{TICKETS}/{ticket['id']}"
+        assert browser.post("/api/logout", headers=CSRF).status_code == 204
+        login(support, SUPPORT_FORM)
+        if expire_session:
+            set_session_near_absolute_expiry(answer_ready, clock[0])
+
+        # 列鎖阻塞讀取工單狀態，SHARE 表鎖則只擋 UPDATE，確保驗證兩個等待點。
+        key_file = answer_ready.key_file
+        hidden_key = key_file.with_suffix(".inactive")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            try:
+                with answer_ready.connect() as blocker:
+                    if block_write:
+                        blocker.execute("LOCK TABLE tickets IN SHARE MODE")
+                    else:
+                        blocker.execute("SELECT id FROM tickets FOR UPDATE")
+                    result = executor.submit(
+                        support.post,
+                        f"{detail}/close",
+                        headers=CSRF,
+                        json={"resolution": "私人處理結果"},
+                    )
+                    wait_for_search_lock(answer_ready, blocker.info.backend_pid)
+
+                    # 確認已進入交易才推進測試時鐘或暫時移走隔離憑證。
+                    if expire_session:
+                        clock[0] += timedelta(microseconds=1)
+                    else:
+                        key_file.rename(hidden_key)
+                denied = result.result(timeout=5)
+                assert denied.status_code == (401 if expire_session else 503)
+                assert "私人處理結果" not in denied.text
+            finally:
+                # 回復測試憑證以驗證原工單仍可讀取。
+                if hidden_key.exists():
+                    hidden_key.rename(key_file)
+
+        # 到期後撤銷實體 Session，並以提單者重新登入查核無任何結案欄位或快照被改動。
+        if expire_session:
+            with answer_ready.connect() as conn:
+                assert conn.execute(
+                    "SELECT count(*) FROM login_sessions"
+                ).fetchone() == (0,)
+        login(browser)
+        assert browser.get(detail).json() == ticket
 
 
 @pytest.mark.parametrize("has_ticket", [False, True])
@@ -369,10 +680,7 @@ def test_ticket_pages_have_stable_membership_and_strict_limits(
             )
             assert response.status_code == 200
             ticket = response.json()
-            summary = {
-                key: ticket[key]
-                for key in ("id", "description", "created_at", "status")
-            }
+            summary = {key: ticket[key] for key in TICKET_SUMMARY_FIELDS}
             assert datetime.fromisoformat(summary["created_at"]) == clock[0]
             expected.append(summary)
 

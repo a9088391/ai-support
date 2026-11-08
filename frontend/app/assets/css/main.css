@@ -497,13 +497,22 @@ p {
   list-style: none;
 }
 
-.ticket-list .ticket-summary-text {
+.ticket-list .ticket-summary-text,
+.ticket-list .ticket-summary-preview {
   display: -webkit-box;
-  margin-bottom: 0.65rem;
   overflow: hidden;
-  font-weight: 650;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+.ticket-list .ticket-summary-text {
+  margin-bottom: 0.65rem;
+  font-weight: 650;
+}
+
+.ticket-summary-preview {
+  color: var(--muted);
+  white-space: normal;
 }
 
 .ticket-snapshot {

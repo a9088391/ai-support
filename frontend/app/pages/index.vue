@@ -9,6 +9,9 @@ const LOGOUT_UNCONFIRMED = "目前無法確認登出結果，請手動重試登�
 const MAX_KNOWLEDGE_QUERY_CODE_POINTS = 2_000;
 const MAX_QUESTION_CODE_POINTS = 2_000;
 const MAX_ANSWER_SOURCES = 40;
+const MAX_CONVERSATION_QUESTIONS = 10;
+const ANSWER_LIMIT_MESSAGE = "這段對話已達 10 題上限，請開始新的對話。";
+const ANSWER_KEY_CHANGED = "Gemini 設定已變更，請重新提出問題。";
 const ANSWER_ID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 // 與後端純文字契約一致，保留定位字元、換行與完整的代理字元對。
 const INVALID_QUESTION_CHARACTER =
@@ -44,16 +47,30 @@ const answerStatusMessages = {
   answered: "",
   insufficient_evidence: "本次搜尋沒有足夠依據回答這個問題。",
   invalid_output: "本次回答未通過驗證。您可以查看已取得的搜尋結果。",
-  rate_limited: "模型請求已達額度或速率上限，請稍後再手動提出問題。",
+  rate_limited: "模型請求已達額度或速率上限，請稍後再手動重試。",
   timed_out: "本次問答已逾時。您可以查看已取得的搜尋結果。",
-  unavailable: "模型暫時無法使用，請稍後再手動提出問題。",
+  unavailable: "模型暫時無法使用，請稍後再手動重試。",
 } as const;
 
 interface AnswerOutput {
+  readonly conversation_id: string;
+  readonly question_id: string;
+  readonly attempt_id: string;
   readonly status: keyof typeof answerStatusMessages;
   readonly answer: string | null;
   readonly citations: readonly KnowledgeSearchResult[];
   readonly search_results: readonly KnowledgeSearchResult[];
+}
+
+interface AnswerNotice {
+  readonly message: string;
+  readonly block: "conversation" | "new-question" | "retry" | null;
+}
+
+interface AnswerEntry {
+  readonly question: string;
+  readonly output: AnswerOutput;
+  readonly notice?: AnswerNotice;
 }
 
 type KnowledgeSearchState = "idle" | "loading" | "success" | "empty" | "error";
@@ -61,6 +78,10 @@ type KnowledgeSearchState = "idle" | "loading" | "success" | "empty" | "error";
 interface Operation {
   readonly controller: AbortController;
   readonly foregroundEpoch: number | null;
+}
+
+interface AnswerOperation extends Operation {
+  readonly retry: AnswerEntry | null;
 }
 
 interface ApiResult {
@@ -96,13 +117,12 @@ const knowledgeSearchError = ref("");
 const knowledgeSearchState = ref<KnowledgeSearchState>("idle");
 const knowledgeResults = ref<KnowledgeSearchResult[]>([]);
 const answerQuestion = ref("");
-const submittedQuestion = ref("");
 const answerQuestionError = ref("");
-const answerFailure = ref("");
-const answerOutput = shallowRef<AnswerOutput | null>(null);
-const answerOperation = shallowRef<Operation | null>(null);
+const answerNotice = shallowRef<AnswerNotice | null>(null);
+const answerEntries = shallowRef<readonly AnswerEntry[]>([]);
+const seenAnswerAttempts = new Set<string>();
+const answerOperation = shallowRef<AnswerOperation | null>(null);
 const answerQuestionInput = ref<HTMLTextAreaElement | null>(null);
-const answerResultHeading = ref<HTMLElement | null>(null);
 const usernameInput = ref<HTMLInputElement | null>(null);
 const passwordInput = ref<HTMLInputElement | null>(null);
 const knowledgeQueryInput = ref<HTMLInputElement | null>(null);
@@ -129,6 +149,16 @@ const isServiceReady = computed(
     !isLoading.value &&
     !hasSetupError.value &&
     setupStatus.value?.status === "ready",
+);
+// 只用已確認的終態計入畫面題數；伺服器回報達限時也停止收新題。
+const isAnswerAtLimit = computed(
+  () =>
+    answerEntries.value.length >= MAX_CONVERSATION_QUESTIONS ||
+    answerNotice.value?.block === "new-question",
+);
+// 對話不可延續時仍展示已取得的結果，等使用者明確開始新對話。
+const isAnswerConversationBlocked = computed(
+  () => answerNotice.value?.block === "conversation",
 );
 // 工作台標題直接依伺服器回傳角色顯示，不建立額外導航狀態。
 const roleTitle = computed(() =>
@@ -262,8 +292,8 @@ function isKnowledgeSearchResult(item: unknown): item is KnowledgeSearchResult {
   );
 }
 
-// 只接受後端產生的不透明問答識別，畫面不需要保存這些值。
-function isAnswerId(value: unknown): boolean {
+// 只接受後端產生的不透明識別，供目前頁面追問與重試。
+function isAnswerId(value: unknown): value is string {
   return typeof value === "string" && ANSWER_ID.test(value);
 }
 
@@ -334,8 +364,11 @@ function readAnswerOutput(value: unknown): AnswerOutput | null {
     return null;
   }
 
-  // 識別只用來檢查回應，畫面只保留內容與結果狀態。
+  // 只保留核對過的識別與內容，供本頁的後續操作使用。
   return {
+    conversation_id: dto.conversation_id,
+    question_id: dto.question_id,
+    attempt_id: dto.attempt_id,
     status: status as AnswerOutput["status"],
     answer,
     citations,
@@ -976,19 +1009,50 @@ async function submitKnowledgeSearch(): Promise<void> {
   }
 }
 
-// 清除頁面上的問答並取消等待，避免返回頁面或切換身分後讀到舊內容。
-function clearAnswer(): void {
+// 清除本頁對話並取消等待，避免遲到結果還原已清除的內容。
+function clearAnswer(keepDraft = false): void {
   // 先撤銷畫面更新權，再中止傳輸，遲到結果不能復原已清除的內容。
   const operation = answerOperation.value;
   answerOperation.value = null;
   operation?.controller.abort();
 
-  // 問題、結果與錯誤只存在於當前登入且啟用的頁面。
-  answerQuestion.value = "";
-  submittedQuestion.value = "";
+  // 只有同一工作台內明確開始新對話，才保留尚未送出的草稿。
+  if (!keepDraft) {
+    answerQuestion.value = "";
+  }
   answerQuestionError.value = "";
-  answerFailure.value = "";
-  answerOutput.value = null;
+  answerNotice.value = null;
+  answerEntries.value = [];
+  seenAnswerAttempts.clear();
+}
+
+// 使用者明確放棄前文後才回到第一題，並讓焦點回到仍可編輯的草稿。
+function startNewConversation(): void {
+  // 防止鍵盤或程式事件在已送出的異動還未收斂前清除對話。
+  // prettier-ignore
+  if (
+    !isServiceReady.value
+    || !identity.value
+    || answerOperation.value
+  ) {
+    return;
+  }
+  clearAnswer(true);
+  focus(answerQuestionInput);
+}
+
+// 離開頁面也撤銷共用安全回讀，避免快取頁回來時套用舊的私有操作。
+function clearPageBusinessState(): void {
+  // 快取返回後須重新檢查啟用，不能沿用離開前開始的檢查。
+  leaveForeground();
+  const readback = businessSetupReadback;
+  businessSetupReadback = null;
+  readback?.controller.abort();
+
+  // 搜尋及問答草稿與結果都不應由瀏覽器返回還原。
+  cancelKnowledgeSearch();
+  knowledgeQuery.value = "";
+  clearAnswer();
 }
 
 // 只有原本的登入身分與等待操作可以接收本次問答。
@@ -1021,45 +1085,159 @@ function validateQuestion(question: string): string {
   return BLANK_PLAIN_TEXT.test(question) ? "請輸入您的問題。" : "";
 }
 
-// 每次手動送出只建立一個新問題，等待模型時仍允許搜尋與登出。
-async function submitAnswer(): Promise<void> {
-  // 以原本的登入物件與獨立操作識別目前等待者，防止重複送出。
+// 僅辨識問答契約的固定錯誤；其他回應不能證明送出是否已生效。
+function readAnswerFailure(result: ApiResult, isRetry: boolean): AnswerNotice {
+  // 以固定比對辨識可安全恢復的狀態，不呈現任意伺服器錯誤文字。
+  const data = result.data;
+  const detail =
+    typeof data === "object" && data !== null && "detail" in data
+      ? data.detail
+      : null;
+  if (result.status === 409) {
+    if (detail === ANSWER_LIMIT_MESSAGE) {
+      return { message: ANSWER_LIMIT_MESSAGE, block: "new-question" };
+    }
+    if (detail === "這段對話正在處理問題，請稍後再試。") {
+      return { message: detail, block: null };
+    }
+    if (detail === "這段對話缺少可延續的前文，請開始新的對話。") {
+      return { message: detail, block: "conversation" };
+    }
+    if (isRetry && detail === "這次問答已無法重試。") {
+      return { message: detail, block: "retry" };
+    }
+  }
+
+  // 對話無法存取或沿用時仍保留本頁已知結果，讓使用者自行開始新的對話。
+  if (result.status === 410 && detail === "問答暫存已到期。") {
+    return { message: detail, block: "conversation" };
+  }
+  if (result.status === 404 && detail === "找不到這次問答。") {
+    return { message: detail, block: "conversation" };
+  }
+  if (result.status === 503 && detail === ANSWER_KEY_CHANGED) {
+    return { message: ANSWER_KEY_CHANGED, block: "conversation" };
+  }
+
+  // 格式或來源拒絕不等同於可重試的失敗終態。
+  if (result.status === 422 && isRetry) {
+    return { message: "重試要求未通過格式檢查。", block: "retry" };
+  }
+  if (result.status === 403) {
+    return {
+      message: "問答要求未通過來源驗證，請重新載入本機頁面後再試。",
+      block: null,
+    };
+  }
+
+  // 遺失終態就沒有可驗證的新識別，不能重送或冒稱後端未執行。
+  return isRetry
+    ? {
+        message:
+          "無法確認重試結果。伺服器可能已完成重試，後續問答的前文可能與本頁顯示不同；此題不能再重試。",
+        block: "retry",
+      }
+    : {
+        message:
+          "無法確認送出結果。伺服器可能已處理這一題。已保留草稿；請先開始新的對話。",
+        block: "conversation",
+      };
+}
+
+// 驗證終態識別屬於本次操作，並拒絕重複採用已看過的嘗試。
+function matchesAnswerOperation(
+  output: AnswerOutput,
+  conversationId: string | undefined,
+  retry: AnswerEntry | null,
+): boolean {
+  // 首題沒有預先識別；追問及重試必須回到正在使用的對話。
+  if (
+    seenAnswerAttempts.has(output.attempt_id) ||
+    (conversationId && output.conversation_id !== conversationId)
+  ) {
+    return false;
+  }
+  // 重試只能替換原題；追問則必須回傳一個未見過的新問題。
+  return retry
+    ? output.question_id === retry.output.question_id
+    : !answerEntries.value.some(
+        // 問題識別是清單鍵；拒絕讓追問覆蓋先前的卡片。
+        (entry) => entry.output.question_id === output.question_id,
+      );
+}
+
+// 送出首題、追問或同題重試；共用等待鎖但不佔用搜尋與登出的操作。
+async function submitAnswer(retry: AnswerEntry | null = null): Promise<void> {
+  // 以原本的登入物件與獨立操作識別目前等待者，防止交叉或重複送出。
   const owner = identity.value;
   // prettier-ignore
   if (
     !isServiceReady.value
     || !owner
     || answerOperation.value
+    || isAnswerConversationBlocked.value
   ) {
     return;
   }
 
-  // 驗證失敗聚焦原欄位，保留草稿讓使用者修正。
-  const question = answerQuestion.value;
-  answerQuestionError.value = validateQuestion(question);
-  if (answerQuestionError.value) {
-    focus(answerQuestionInput);
+  // 重試只能使用目前仍可重試的卡片；本地題數達限不影響重試。
+  const position = retry
+    ? answerEntries.value.indexOf(retry)
+    : answerEntries.value.length;
+  // prettier-ignore
+  if (
+    retry
+    && (
+      position < 0
+      || retry.output.status === "answered"
+      || retry.notice?.block === "retry"
+    )
+  ) {
     return;
   }
 
-  // 固定本次問題快照與等待擁有權，並移除前一次結果及訊息。
-  const operation: Operation = {
+  // 驗證新題草稿；不因重試清除或檢查下一題的輸入。
+  const question = retry?.question ?? answerQuestion.value;
+  if (!retry) {
+    if (isAnswerAtLimit.value) {
+      return;
+    }
+    answerQuestionError.value = validateQuestion(question);
+    if (answerQuestionError.value) {
+      focus(answerQuestionInput);
+      return;
+    }
+    answerNotice.value = null;
+  }
+
+  // 重試只傳原本的識別，讓後端使用可信題目與前文；追問只送新題。
+  const conversationId = answerEntries.value[0]?.output.conversation_id;
+  const body = retry
+    ? {
+        conversation_id: retry.output.conversation_id,
+        question_id: retry.output.question_id,
+        attempt_id: retry.output.attempt_id,
+      }
+    : conversationId
+      ? { question, conversation_id: conversationId }
+      : { question };
+  const operation: AnswerOperation = {
     controller: new AbortController(),
     foregroundEpoch: null,
+    retry,
   };
   answerOperation.value = operation;
-  submittedQuestion.value = question;
-  answerOutput.value = null;
-  answerFailure.value = "";
+  let focusId = `answer-result-${position}`;
 
   try {
-    // 僅送出這一題；模型等待使用較長傳輸期限，禁止自動重送。
+    // 只在問答讀取固定錯誤本文；模型等待使用較長期限，禁止自動重送。
     const result = await requestApi(
       "/api/answers",
       operation,
       {
         method: "POST",
-        body: { question },
+        body,
+        ignoreResponseError: true,
         headers: { "X-CSRF-Protection": "1" },
       },
       ANSWER_REQUEST_TIMEOUT_MS,
@@ -1074,36 +1252,46 @@ async function submitAnswer(): Promise<void> {
       return;
     }
 
-    // 啟用狀態回讀屬於工作台；返回後仍須確認本次問答的畫面擁有權。
+    // 回讀啟用狀態後仍要確認問答擁有權；ready 也不能證明這次問答的結果。
     if (result.status === 503) {
-      const setupResult = await recheckBusinessSetup();
+      await recheckBusinessSetup();
       if (!isCurrentAnswer(operation, owner)) {
         return;
       }
-      answerFailure.value =
-        setupResult === "ready"
-          ? "問答暫時無法使用，服務仍已啟用。請稍後再手動提出問題。"
-          : "問答暫時無法完成，請稍後再手動提出問題。";
-    } else if (result.status === 200) {
-      // 只有完整終態可交付回答或保留的搜尋結果。
-      answerOutput.value = readAnswerOutput(result.data);
-      if (!answerOutput.value) {
-        answerFailure.value = "問答回應格式無法確認，請稍後再手動提出問題。";
-      }
-    } else if (result.status === 422) {
-      // 後端仍是輸入驗證的最後防線，拒絕時讓使用者回到原欄位。
-      submittedQuestion.value = "";
+    }
+    // 後端是輸入驗證的最後防線；格式拒絕後保留草稿供修正。
+    if (result.status === 422 && !retry) {
       answerQuestionError.value = "問題未通過格式檢查，請修正後再提出。";
       focus(answerQuestionInput);
       return;
-    } else if (result.status === 403) {
-      // 僅顯示固定復原方式，避免將服務端診斷送進畫面。
-      answerFailure.value =
-        "問答要求未通過來源驗證，請重新載入本機頁面後再試。";
+    }
+
+    // 只採用可驗證的終態；無效回應不增加題數、不替換舊結果。
+    const output = result.status === 200 ? readAnswerOutput(result.data) : null;
+    const entries = [...answerEntries.value];
+    if (output && matchesAnswerOperation(output, conversationId, retry)) {
+      seenAnswerAttempts.add(output.attempt_id);
+      entries[position] = { question, output };
+      answerEntries.value = entries;
+      if (!retry) {
+        answerQuestion.value = "";
+      }
     } else {
-      // 網路錯誤或傳輸逾時無法證明後端未執行，等待使用者明確提出下一題。
-      answerFailure.value =
-        "目前無法確認問答結果，請檢查本機服務後再手動提出問題。";
+      // 局部重試錯誤跟著原卡保留；整段對話的限制則放在提問區。
+      const notice = readAnswerFailure(result, retry !== null);
+      // prettier-ignore
+      if (
+        retry
+        && notice.block !== "conversation"
+        && notice.block !== "new-question"
+      ) {
+        entries[position] = { ...retry, notice };
+        answerEntries.value = entries;
+        focusId = `answer-retry-notice-${position}`;
+      } else {
+        answerNotice.value = notice;
+        focusId = "answer-notice-title";
+      }
     }
   } finally {
     // 只釋放本次等待；清除頁面後開始的新操作不受舊回應影響。
@@ -1112,8 +1300,18 @@ async function submitAnswer(): Promise<void> {
     }
   }
 
-  // 先結束等待並排入畫面更新，下一個 Vue 更新週期才有結果標題可聚焦。
-  focus(answerResultHeading);
+  // 待結果掛載後才聚焦；切換身分或清除對話後不聚焦舊位置。
+  const entries = answerEntries.value;
+  await nextTick();
+  // prettier-ignore
+  if (
+    identity.value === owner
+    && isServiceReady.value
+    && answerEntries.value === entries
+    && !answerOperation.value
+  ) {
+    document.getElementById(focusId)?.focus();
+  }
 }
 
 // 登出失敗或逾時時只讀回 session，避免盲目重送非冪等異動。
@@ -1207,8 +1405,9 @@ onMounted(() => {
   window.addEventListener("blur", leaveForeground);
   window.addEventListener("focus", checkSetupOnForeground);
   document.addEventListener("visibilitychange", handleVisibilityChange);
-  // 瀏覽器可能快取離開的頁面；離開時先撤銷問答，返回也不續聊。
-  window.addEventListener("pagehide", clearAnswer);
+  // 瀏覽器可能快取離開的頁面；返回只檢查啟用，不續聊。
+  window.addEventListener("pagehide", clearPageBusinessState);
+  window.addEventListener("pageshow", checkSetupOnForeground);
 });
 
 // 離開頁面時取消目前操作，使遲到回應不能更新卸載後的畫面。
@@ -1217,12 +1416,11 @@ onBeforeUnmount(() => {
   window.removeEventListener("blur", leaveForeground);
   window.removeEventListener("focus", checkSetupOnForeground);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
-  window.removeEventListener("pagehide", clearAnswer);
+  window.removeEventListener("pagehide", clearPageBusinessState);
+  window.removeEventListener("pageshow", checkSetupOnForeground);
 
   // 工作台卸載時取消業務操作與回讀，避免遲到結果留在新畫面。
-  cancelKnowledgeSearch();
-  clearAnswer();
-  businessSetupReadback?.controller.abort();
+  clearPageBusinessState();
 
   // 先撤銷畫面更新權，再中止請求及其後續 readback。
   const operation = activeOperation.value;
@@ -1465,15 +1663,98 @@ onBeforeUnmount(() => {
           <p class="eyebrow">AI 問答</p>
           <h2 id="answer-title">提出問題</h2>
           <p class="knowledge-search-intro">
-            以本機知識文件尋找依據。每次送出一個新問題，請使用虛構、非敏感內容。
+            以本機知識文件尋找依據。您可以在本頁追問，或手動重試失敗的問題。請使用虛構、非敏感內容；離開頁面後無法續聊。
+          </p>
+          <p class="knowledge-search-help" role="status">
+            本段對話已確認 {{ answerEntries.length }} /
+            {{ MAX_CONVERSATION_QUESTIONS }} 題；重試不增加題數。
           </p>
 
+          <section
+            v-if="answerNotice || isAnswerAtLimit"
+            class="knowledge-search-feedback"
+            aria-labelledby="answer-notice-title"
+            role="alert"
+          >
+            <h3 id="answer-notice-title" tabindex="-1">對話提示</h3>
+            <p v-if="answerNotice">{{ answerNotice.message }}</p>
+            <p v-if="isAnswerAtLimit && answerNotice?.block !== 'new-question'">
+              {{ ANSWER_LIMIT_MESSAGE }}
+            </p>
+          </section>
+
+          <ol
+            v-if="answerEntries.length"
+            class="answer-history"
+            aria-label="本段對話問答"
+          >
+            <li
+              v-for="(entry, position) in answerEntries"
+              :key="entry.output.question_id"
+              class="knowledge-search-state"
+            >
+              <h3>第 {{ position + 1 }} 題</h3>
+              <p class="answer-text">{{ entry.question }}</p>
+              <template v-if="entry.output.status === 'answered'">
+                <h4 :id="`answer-result-${position}`" tabindex="-1">回答</h4>
+                <p class="knowledge-search-help">
+                  模型 <code>{{ SETUP_MODEL }}</code>
+                </p>
+                <p class="answer-text">{{ entry.output.answer }}</p>
+                <h5>引用來源</h5>
+                <KnowledgeResultList :results="entry.output.citations" />
+              </template>
+              <template v-else>
+                <div class="knowledge-search-feedback">
+                  <h4 :id="`answer-result-${position}`" tabindex="-1">
+                    {{
+                      answerOperation?.retry === entry
+                        ? "上次問答未完成"
+                        : "問答未完成"
+                    }}
+                  </h4>
+                  <p>{{ answerStatusMessages[entry.output.status] }}</p>
+                  <p
+                    v-if="entry.notice && answerOperation?.retry !== entry"
+                    :id="`answer-retry-notice-${position}`"
+                    role="alert"
+                    tabindex="-1"
+                  >
+                    {{ entry.notice.message }}
+                  </p>
+                </div>
+                <h5>本次已取得的搜尋結果</h5>
+                <KnowledgeResultList
+                  v-if="entry.output.search_results.length"
+                  :results="entry.output.search_results"
+                />
+                <p v-else>本次問答沒有取得符合的知識片段。</p>
+                <p v-if="answerOperation?.retry === entry" role="status">
+                  正在重試這一題，請稍候。
+                </p>
+                <button
+                  v-if="
+                    !isAnswerConversationBlocked &&
+                    entry.notice?.block !== 'retry'
+                  "
+                  type="button"
+                  class="answer-secondary-action"
+                  :aria-label="`重試這一題（第 ${position + 1} 題）`"
+                  :disabled="answerOperation !== null"
+                  @click="submitAnswer(entry)"
+                >
+                  重試這一題
+                </button>
+              </template>
+            </li>
+          </ol>
+
           <form
-            class="login-form"
+            class="login-form answer-form"
             aria-labelledby="answer-title"
             :aria-busy="answerOperation !== null"
             novalidate
-            @submit.prevent="submitAnswer"
+            @submit.prevent="submitAnswer()"
           >
             <div class="field-group">
               <label for="answer-question">您的問題</label>
@@ -1485,7 +1766,9 @@ onBeforeUnmount(() => {
                 rows="4"
                 required
                 autocomplete="off"
-                :readonly="answerOperation !== null"
+                :readonly="
+                  answerOperation !== null && answerOperation.retry === null
+                "
                 :aria-invalid="answerQuestionError ? 'true' : undefined"
                 :aria-describedby="
                   answerQuestionError
@@ -1509,83 +1792,33 @@ onBeforeUnmount(() => {
             <button
               type="submit"
               class="primary-action"
-              :disabled="answerOperation !== null"
+              :disabled="
+                answerOperation !== null ||
+                isAnswerAtLimit ||
+                isAnswerConversationBlocked
+              "
             >
-              {{ answerOperation ? "問答處理中…" : "提出問題" }}
+              {{ answerEntries.length ? "追問" : "提出問題" }}
+            </button>
+            <button
+              v-if="answerEntries.length || isAnswerConversationBlocked"
+              type="button"
+              class="answer-secondary-action"
+              :disabled="answerOperation !== null"
+              @click="startNewConversation"
+            >
+              開始新的對話
             </button>
           </form>
 
-          <section
-            v-if="submittedQuestion"
-            class="knowledge-search-state"
-            aria-labelledby="submitted-question-title"
-          >
-            <h3 id="submitted-question-title">本次問題</h3>
-            <p class="answer-text">{{ submittedQuestion }}</p>
-          </section>
-
           <p
-            v-if="answerOperation"
+            v-if="answerOperation && !answerOperation.retry"
+            id="answer-pending-status"
             class="knowledge-search-state"
             role="status"
           >
-            正在查詢知識文件並處理問題，請稍候。
+            正在查詢知識文件並處理第 {{ answerEntries.length + 1 }} 題，請稍候。
           </p>
-
-          <section
-            v-else-if="answerOutput?.status === 'answered'"
-            class="knowledge-search-state"
-            aria-labelledby="answer-result-title"
-          >
-            <h3
-              id="answer-result-title"
-              ref="answerResultHeading"
-              tabindex="-1"
-            >
-              回答
-            </h3>
-            <p class="knowledge-search-help">
-              模型 <code>{{ SETUP_MODEL }}</code>
-            </p>
-            <p class="answer-text">{{ answerOutput.answer }}</p>
-            <h4>引用來源</h4>
-            <KnowledgeResultList :results="answerOutput.citations" />
-          </section>
-
-          <template v-else-if="answerOutput || answerFailure">
-            <section
-              class="knowledge-search-feedback"
-              aria-labelledby="answer-error-title"
-              role="alert"
-            >
-              <h3
-                id="answer-error-title"
-                ref="answerResultHeading"
-                tabindex="-1"
-              >
-                問答未完成
-              </h3>
-              <p>
-                {{
-                  answerOutput
-                    ? answerStatusMessages[answerOutput.status]
-                    : answerFailure
-                }}
-              </p>
-            </section>
-            <section
-              v-if="answerOutput"
-              class="knowledge-results"
-              aria-labelledby="answer-search-results-title"
-            >
-              <h3 id="answer-search-results-title">本次已取得的搜尋結果</h3>
-              <KnowledgeResultList
-                v-if="answerOutput.search_results.length"
-                :results="answerOutput.search_results"
-              />
-              <p v-else>本次問答沒有取得符合的知識片段。</p>
-            </section>
-          </template>
         </section>
 
         <section

@@ -72,7 +72,7 @@ CREATE INDEX IF NOT EXISTS model_requests_rejected_binding
 CREATE INDEX IF NOT EXISTS model_requests_account_quota
     ON model_requests (username, service_day) WHERE delivery <> 'unsent';
 
--- 單輪從新對話開始；到期後連同所屬問題與嘗試一併移除。
+-- 到期後連同對話所屬問題與嘗試一併移除。
 CREATE TABLE IF NOT EXISTS conversations (
     id uuid PRIMARY KEY,
     username text NOT NULL REFERENCES demo_accounts (username),
@@ -100,3 +100,13 @@ CREATE TABLE IF NOT EXISTS answer_attempts (
 );
 
 CREATE INDEX IF NOT EXISTS answer_attempts_by_question ON answer_attempts (question_id);
+
+-- 舊版每段對話只有一題；位置可沿用 1，且舊回答沒有可安全送回的模型步驟。
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS key_version uuid;
+ALTER TABLE questions ADD COLUMN IF NOT EXISTS position integer NOT NULL DEFAULT 1;
+ALTER TABLE answer_attempts
+    ADD COLUMN IF NOT EXISTS model_steps jsonb,
+    ADD COLUMN IF NOT EXISTS attempt_number integer NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS deadline_at timestamptz;
+CREATE UNIQUE INDEX IF NOT EXISTS questions_by_position ON questions (conversation_id, position);
+CREATE UNIQUE INDEX IF NOT EXISTS attempts_by_number ON answer_attempts (question_id, attempt_number);

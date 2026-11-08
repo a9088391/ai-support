@@ -11,7 +11,7 @@ from multiprocessing.connection import Connection as ProcessPipe
 from threading import Barrier, Event
 from time import monotonic
 from typing import cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import anyio
 import httpcore
@@ -21,13 +21,15 @@ from backend import answer_storage, answers, cli, knowledge, sessions
 from backend.answer_storage import (
     Access,
     Attempt,
+    AttemptWindow,
     Dispatch,
     lock_dispatch,
+    lock_running_attempt,
     search_attempt,
 )
 from backend.app import create_app
 from backend.credentials import set_key
-from backend.database import Settings, reserve_request
+from backend.database import Settings, initialize, reserve_request
 from backend.tests.conftest import TEST_DSN
 from backend.tests.test_activation import success
 from backend.tests.test_knowledge import (
@@ -48,7 +50,9 @@ from backend.tests.test_sessions import (
 from backend.tests.test_sessions import clock as clock
 from fastapi.testclient import TestClient
 from httpcore._backends.auto import AutoBackend
-from psycopg import Connection
+from psycopg import Connection, Cursor
+from psycopg.abc import Params
+from psycopg.sql import SQL, Composed
 from starlette.types import Message, Scope
 
 ANSWERS = "/api/answers"
@@ -241,6 +245,430 @@ def test_answer_grounds_citations_in_a_real_tool_result(
     assert continuation[3]["type"] == "function_result"
     assert continuation[3]["call_id"] == "call-delivery"
     assert "一般配送需兩個工作天。" in str(continuation[3]["result"])
+
+
+# 追問攜帶完整可信前文，但沒有本次工具結果就不能引用上一題的證據。
+def test_follow_up_replays_exact_provider_steps_without_reusing_evidence(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+) -> None:
+    assert import_batch(monkeypatch, ORIGINAL) == 0
+    final = model_output("一般配送需兩個工作天。", [2])
+    final_step = final.json()["steps"][0]
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", THOUGHT, CALL),
+            interaction("completed", THOUGHT, final_step),
+            model_output("沿用上一題的引用。", [2]),
+        ]
+    )
+
+    # 第二題沿用後端識別；公開回應只提供本題結果與新識別。
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        first = ask(browser).json()
+        assert first["status"] == "answered"
+        response = browser.post(
+            ANSWERS,
+            headers=CSRF,
+            json={
+                "question": "那一般要幾天？",
+                "conversation_id": first["conversation_id"],
+            },
+        )
+        assert response.status_code == 200
+        second = response.json()
+        assert second["conversation_id"] == first["conversation_id"]
+        assert second["question_id"] != first["question_id"]
+        assert second["attempt_id"] != first["attempt_id"]
+        assert second["status"] == "invalid_output"
+        assert second["answer"] is None and second["citations"] == []
+        assert second["search_results"] == []
+        assert "signature" not in response.text and "call-delivery" not in response.text
+
+    # SDK 傳輸保留原順序、原始模型輸出、工具結果與不透明簽章，不使用供應商互動 ID。
+    _, continuation, follow_up = [
+        json.loads(raw.split(b"\r\n\r\n", 1)[1]) for raw in provider_script.requests
+    ]
+    assert follow_up["store"] is False and "previous_interaction_id" not in follow_up
+    assert follow_up["input"] == [
+        *continuation["input"],
+        THOUGHT,
+        final_step,
+        {"type": "user_input", "content": [{"type": "text", "text": "那一般要幾天？"}]},
+    ]
+
+
+# 重試只送已發給頁面的識別，原始問題與可信前文由後端載入。
+def retry_form(payload: dict[str, str]) -> dict[str, str]:
+    return {
+        key: payload[key] for key in ("conversation_id", "question_id", "attempt_id")
+    }
+
+
+# 同題重試不採用失敗步驟或較晚問題，且過時嘗試不能再讀取或重送。
+def test_retry_uses_original_question_and_only_earlier_successes(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+) -> None:
+    assert import_batch(monkeypatch, ORIGINAL) == 0
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", THOUGHT, CALL),
+            model_output("一般配送需兩個工作天。", [2]),
+            interaction("requires_action", {**CALL, "id": "failed-call"}),
+            httpx.Response(502, json={"error": {"status": "UNAVAILABLE"}}),
+            interaction("requires_action", {**CALL, "id": "later-call"}),
+            model_output("一般配送需兩個工作天。", [2]),
+            interaction("requires_action", {**CALL, "id": "retry-call"}),
+            model_output("一般配送需兩個工作天。", [2]),
+        ]
+    )
+
+    # 原問題失敗後仍可送新題，重試原問題時更換嘗試識別而保留原題及對話。
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        first = ask(browser).json()
+        conversation = {"conversation_id": first["conversation_id"]}
+        for question, expected in (("原題", "unavailable"), ("後來的題目", "answered")):
+            response = browser.post(
+                ANSWERS, headers=CSRF, json={**conversation, "question": question}
+            )
+            assert response.status_code == 200
+            assert response.json()["status"] == expected
+            if expected == "unavailable":
+                old = response.json()
+        form = retry_form(old)
+        response = browser.post(ANSWERS, headers=CSRF, json=form)
+        assert response.status_code == 200
+        retried = response.json()
+        assert retried["status"] == "answered"
+        assert retry_form(retried) == {**form, "attempt_id": retried["attempt_id"]}
+        assert retried["attempt_id"] != old["attempt_id"]
+        assert browser.get(f"{ANSWERS}/{old['attempt_id']}").status_code == 404
+        assert browser.get(f"{ANSWERS}/{retried['attempt_id']}").json() == retried
+        assert browser.post(ANSWERS, headers=CSRF, json=form).status_code == 409
+        assert (
+            browser.post(ANSWERS, headers=CSRF, json=retry_form(retried)).status_code
+            == 409
+        )
+
+    # 相同原始問題及較早成功前文會逐步重現，失敗與較晚步驟沒有進入重試。
+    wire = [
+        json.loads(raw.split(b"\r\n\r\n", 1)[1]) for raw in provider_script.requests
+    ]
+    assert len(wire) == 8
+    assert wire[6]["input"] == wire[2]["input"]
+    assert wire[6]["input"][-1]["content"][0]["text"] == "原題"
+    with answer_ready.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM questions").fetchone() == (3,)
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (9,)
+
+
+# 初始受理後、SDK 寫入前若對話達到絕對期限，不建立預留也不送私人前文。
+def test_follow_up_expiring_at_wire_never_reserves_or_sends(
+    answer_ready: Settings,
+    provider_script: ProviderScript,
+    clock: list[datetime],
+) -> None:
+    provider_script.responses.append(model_output(None, []))
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        first = ask(browser).json()
+        with answer_ready.connect() as conn:
+            conn.execute(
+                "UPDATE conversations SET created_at = %s",
+                (clock[0] - timedelta(hours=2) + timedelta(microseconds=1),),
+            )
+
+        # 只移動可控制的測試時間，實際連線、查驗及模型預留照常運行。
+        async def expire_at_connect() -> None:
+            clock[0] += timedelta(microseconds=1)
+
+        provider_script.before_connect = expire_at_connect
+        provider_script.responses.append(model_output(None, []))
+        denied = browser.post(
+            ANSWERS,
+            headers=CSRF,
+            json={"question": "追問", "conversation_id": first["conversation_id"]},
+        )
+        assert denied.status_code == 410
+        assert browser.get(f"{ANSWERS}/{first['attempt_id']}").status_code == 410
+
+    # 到期拒絕不能靠事後退款掩蓋一次本可避免的模型預留或外送。
+    assert len(provider_script.requests) == 1
+    with answer_ready.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM model_requests").fetchone() == (2,)
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (2,)
+
+
+# 多個工作階段由資料庫協調；重啟既不重送也不讓新請求覆蓋尚未到期的執行。
+def test_live_attempt_survives_new_app_then_late_reply_cannot_overtake_retry(
+    answer_ready: Settings,
+    provider_script: ProviderScript,
+) -> None:
+    waiting, release = Event(), Event()
+
+    # 第一個重試已寫完 HTTP，但回覆延至另一個應用接手之後。
+    async def pending() -> httpx.Response:
+        waiting.set()
+        assert await anyio.to_thread.run_sync(release.wait, 8)
+        return interaction("requires_action", CALL)
+
+    provider_script.responses.extend(
+        [model_output(None, []), pending, model_output(None, [])]
+    )
+    with (
+        TestClient(create_app(answer_ready), base_url=ORIGIN) as owner,
+        ThreadPoolExecutor(1) as pool,
+    ):
+        login(owner)
+        original = ask(owner).json()
+        first_retry = pool.submit(
+            owner.post, ANSWERS, headers=CSRF, json=retry_form(original)
+        )
+        try:
+            assert waiting.wait(5)
+            with TestClient(create_app(answer_ready), base_url=ORIGIN) as another:
+                login(another)
+                follow_up = {
+                    "conversation_id": original["conversation_id"],
+                    "question": "另一題",
+                }
+
+                # 同帳號不同 Session 在遠端等待期間真的重疊；新應用沒有重送或清除執行。
+                with answer_ready.connect() as conn:
+                    row = conn.execute(
+                        "SELECT id FROM answer_attempts WHERE status = 'running'"
+                    ).fetchone()
+                    assert row is not None
+                    running_id = row[0]
+                current = {**retry_form(original), "attempt_id": str(running_id)}
+                for body in (follow_up, current):
+                    busy = another.post(ANSWERS, headers=CSRF, json=body)
+                    assert busy.status_code == 409
+                    assert busy.json() == {
+                        "detail": "這段對話正在處理問題，請稍後再試。"
+                    }
+                assert len(provider_script.requests) == 2
+                with answer_ready.connect() as conn:
+                    assert conn.execute(
+                        "SELECT count(*) FROM questions"
+                    ).fetchone() == (1,)
+                    assert conn.execute(
+                        "SELECT count(*) FROM answer_attempts"
+                    ).fetchone() == (2,)
+                    assert conn.execute(
+                        "SELECT used FROM daily_model_quota"
+                    ).fetchone() == (3,)
+                    # 模擬停機後留下已過期限的資料，不需要等真實的六十秒。
+                    conn.execute(
+                        "UPDATE answer_attempts SET deadline_at = clock_timestamp() WHERE id = %s",
+                        (running_id,),
+                    )
+
+                # 明確重試才接手，原執行的遲到工具回覆不得再次外呼或寫入結果。
+                accepted = another.post(ANSWERS, headers=CSRF, json=current)
+                assert accepted.status_code == 200
+                result = accepted.json()
+                assert result["question_id"] == original["question_id"]
+                assert result["attempt_id"] != current["attempt_id"]
+                assert result["status"] == "insufficient_evidence"
+                release.set()
+                assert first_retry.result(timeout=5).status_code == 404
+                assert another.get(f"{ANSWERS}/{result['attempt_id']}").json() == result
+        finally:
+            release.set()
+
+    assert len(provider_script.requests) == 3
+    with answer_ready.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM questions").fetchone() == (1,)
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (4,)
+        assert conn.execute(
+            "SELECT status FROM answer_attempts ORDER BY attempt_number"
+        ).fetchall() == [
+            ("insufficient_evidence",),
+            ("stopped",),
+            ("insufficient_evidence",),
+        ]
+
+
+@pytest.mark.parametrize(
+    ("owner_form", "other_form"), [(USER_FORM, SUPPORT_FORM), (SUPPORT_FORM, USER_FORM)]
+)
+# 兩種角色都只能追問、重試與讀取自己的對話；錯誤識別不得建立新問題或預留。
+def test_conversation_writes_reject_other_owners_and_forged_inputs(
+    answer_ready: Settings,
+    provider_script: ProviderScript,
+    owner_form: dict[str, str],
+    other_form: dict[str, str],
+) -> None:
+    provider_script.responses.extend([model_output(None, []), model_output(None, [])])
+    with (
+        TestClient(create_app(answer_ready), base_url=ORIGIN) as owner,
+        TestClient(create_app(answer_ready), base_url=ORIGIN) as other,
+    ):
+        login(owner, owner_form)
+        login(other, other_form)
+        first, second = ask(owner).json(), ask(owner).json()
+        retry = retry_form(first)
+        follow_up = {"conversation_id": first["conversation_id"], "question": "再問"}
+
+        # 不存在與他人的資料共用固定回覆；即使是客服也不能讀取私人聊天。
+        for body in (follow_up, retry):
+            denied = other.post(ANSWERS, headers=CSRF, json=body)
+            missing = other.post(
+                ANSWERS, headers=CSRF, json={**body, "conversation_id": str(uuid4())}
+            )
+            assert denied.status_code == missing.status_code == 404
+            assert denied.json() == missing.json()
+        assert other.get(f"{ANSWERS}/{first['attempt_id']}").status_code == 404
+        assert (
+            owner.post(
+                ANSWERS,
+                headers=CSRF,
+                json={**retry, "attempt_id": second["attempt_id"]},
+            ).status_code
+            == 404
+        )
+
+        # 入口拒絕混合操作、偽造模型資料、缺少來源及所有識別欄位的非法型別。
+        for invalid in (
+            {**retry, "question": "偽造新題"},
+            {**retry, "history": [{"answer": "冒用回答", "citations": [1]}]},
+            {**follow_up, "search_results": [{"id": "假資料"}]},
+            {**follow_up, "conversation_id": None},
+            {**retry, "conversation_id": 7},
+            {**retry, "question_id": "not-a-uuid"},
+            {**retry, "attempt_id": None},
+        ):
+            assert owner.post(ANSWERS, headers=CSRF, json=invalid).status_code == 422
+        assert owner.post(ANSWERS, json=retry).status_code == 403
+
+    assert len(provider_script.requests) == 2
+    with answer_ready.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM questions").fetchone() == (2,)
+        assert conn.execute("SELECT count(*) FROM answer_attempts").fetchone() == (2,)
+
+
+# 第十一個新題不占配額；即使已到上限，重試第十題也沿用同一個題目。
+def test_ten_questions_reject_another_but_allow_retry_and_new_conversation(
+    answer_ready: Settings,
+    provider_script: ProviderScript,
+) -> None:
+    provider_script.responses.extend(model_output(None, []) for _ in range(12))
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        first = ask(browser).json()
+        body = {"conversation_id": first["conversation_id"], "question": "追問"}
+        for _ in range(9):
+            reply = browser.post(ANSWERS, headers=CSRF, json=body)
+            assert (
+                reply.status_code == 200
+                and reply.json()["status"] == "insufficient_evidence"
+            )
+        tenth = reply.json()
+        capped = browser.post(ANSWERS, headers=CSRF, json=body)
+        assert capped.status_code == 409
+        assert capped.json() == {"detail": "這段對話已達 10 題上限，請開始新的對話。"}
+        assert len(provider_script.requests) == 10
+
+        retry = browser.post(ANSWERS, headers=CSRF, json=retry_form(tenth))
+        assert retry.status_code == 200
+        assert retry.json()["question_id"] == tenth["question_id"]
+        assert retry.json()["attempt_id"] != tenth["attempt_id"]
+        assert browser.post(ANSWERS, headers=CSRF, json=body).status_code == 409
+        assert ask(browser).json()["conversation_id"] != first["conversation_id"]
+
+    assert len(provider_script.requests) == 12
+    with answer_ready.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM questions").fetchone() == (11,)
+        assert conn.execute("SELECT count(*) FROM answer_attempts").fetchone() == (12,)
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (13,)
+
+
+# 換 Key 後不能把上一個設定保存的成功步驟送到新專案；新對話仍可正常使用。
+def test_rotating_key_cannot_forward_saved_history(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    mocked_provider: ProviderFixture,
+    provider_script: ProviderScript,
+) -> None:
+    assert import_batch(monkeypatch, ORIGINAL) == 0
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", THOUGHT, CALL),
+            model_output("有依據。", [2]),
+            model_output(None, []),
+        ]
+    )
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        first = ask(browser).json()
+        assert first["status"] == "answered"
+        follow_up = {"conversation_id": first["conversation_id"], "question": "再問"}
+
+        # 只操作測試憑證並經既有 CLI 重新驗證；原有對話未重新綁定。
+        set_key(answer_ready.key_file, "fixture-rotated-conversation-key")
+        _, probes = mocked_provider
+        probes.append(success)
+        assert cli.main(["verify-key"]) == 0
+        for body in (follow_up, retry_form(first)):
+            rejected = browser.post(ANSWERS, headers=CSRF, json=body)
+            assert rejected.status_code == 503
+            assert rejected.json() == {"detail": "Gemini 設定已變更，請重新提出問題。"}
+        assert len(provider_script.requests) == 2
+        assert ask(browser).json()["status"] == "insufficient_evidence"
+
+    request = json.loads(provider_script.requests[-1].split(b"\r\n\r\n", 1)[1])
+    assert len(request["input"]) == 1 and "signature" not in str(request["input"])
+
+
+# 舊成功回應在重跑初始化後仍可讀，但缺少原始步驟的前文不能靜默遺失。
+def test_startup_retains_legacy_answer_and_quota_but_cannot_forward_it(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+) -> None:
+    assert import_batch(monkeypatch, ORIGINAL) == 0
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", CALL),
+            model_output("舊版答案。", [2]),
+            model_output(None, []),
+        ]
+    )
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        cookie = login(browser)
+        legacy = ask(browser).json()
+        assert legacy["status"] == "answered"
+
+    # 新欄位採用舊列的預設值；問題、回應及用量仍由真實 HTTP 及 SDK 建立。
+    with answer_ready.connect() as conn:
+        conn.execute("UPDATE conversations SET key_version = NULL")
+        conn.execute(
+            "UPDATE answer_attempts SET deadline_at = NULL, model_steps = NULL"
+        )
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as restarted:
+        headers = {**CSRF, **replay_cookie(cookie)}
+        assert (
+            restarted.get(f"{ANSWERS}/{legacy['attempt_id']}", headers=headers).json()
+            == legacy
+        )
+        denied = restarted.post(
+            ANSWERS,
+            headers=headers,
+            json={"conversation_id": legacy["conversation_id"], "question": "追問"},
+        )
+        assert denied.status_code == 409
+        assert denied.json() == {"detail": "這段對話缺少可延續的前文，請開始新的對話。"}
+
+    assert len(provider_script.requests) == 2
+    with answer_ready.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM questions").fetchone() == (1,)
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (3,)
 
 
 @pytest.mark.parametrize(
@@ -1002,6 +1430,14 @@ def test_answer_expiry_and_startup_cleanup(
         assert browser.get(path).status_code == 200
         clock[0] += timedelta(microseconds=1)
         assert browser.get(path).status_code == 410
+        # 過期的自有對話不能追問或重試，即使登入尚未到期。
+        for body in (
+            {"question": QUESTION, "conversation_id": payload["conversation_id"]},
+            retry_form(payload),
+        ):
+            denied = browser.post(ANSWERS, headers=CSRF, json=body)
+            assert denied.status_code == 410
+            assert denied.json() == {"detail": "問答暫存已到期。"}
         cookie = browser.cookies[sessions.COOKIE_NAME]
     with TestClient(create_app(answer_ready), base_url=ORIGIN) as restarted:
         assert restarted.get(path, headers=replay_cookie(cookie)).status_code == 404
@@ -1315,9 +1751,9 @@ def test_answer_rechecks_key_and_day_at_wire_admission(
 
     # 真正取得 Session/啟用列鎖後，在最後非同步等待前替換檔案或跨日。
     def after_lock(
-        settings: Settings, digest: bytes, access: Access, *args: float
+        settings: Settings, digest: bytes, attempt: Attempt, *args: float
     ) -> Dispatch:
-        result = original(settings, digest, access, *args)
+        result = original(settings, digest, attempt, *args)
         if change == "key":
             set_key(settings.key_file, "fixture-rotated-before-wire")
         else:
@@ -1347,6 +1783,353 @@ def test_answer_rechecks_key_and_day_at_wire_admission(
         assert conn.execute(
             "SELECT service_day, used FROM daily_model_quota"
         ).fetchall() == [(original_day, 1)]
+
+
+# 將工作階段放在絕對期限前一微秒，保留正常閒置刷新行為。
+def set_session_near_absolute_expiry(settings: Settings, at: datetime) -> None:
+    with settings.connect() as conn:
+        conn.execute(
+            "UPDATE login_sessions SET created_at = %s",
+            (at - sessions.SESSION_MAX + timedelta(microseconds=1),),
+        )
+
+
+# 送出授權交回事件迴圈時登入若到期，HTTP 標頭也不能寫入，且須退回預留。
+def test_absolute_session_expiry_between_admission_and_wire(
+    answer_ready: Settings,
+    provider_script: ProviderScript,
+    clock: list[datetime],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_script.responses.append(model_output(None, []))
+    writes: list[bool] = []
+
+    # 保留實際的鎖及 SDK 傳輸，僅在它們交接時推進測試時鐘。
+    def after_lock(
+        settings: Settings, digest: bytes, attempt: Attempt, deadline: float
+    ) -> Dispatch:
+        result = lock_dispatch(settings, digest, attempt, deadline)
+        clock[0] += timedelta(microseconds=1)
+        return result
+
+    # 直接記錄任何 HTTP 串流寫入，連只有標頭的部分傳輸也能察覺。
+    async def record_write() -> None:
+        writes.append(True)
+
+    provider_script.before_write = record_write
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        set_session_near_absolute_expiry(answer_ready, clock[0])
+        monkeypatch.setattr(answers, "lock_dispatch", after_lock)
+        assert ask(browser).status_code == 401
+
+    # 到期撤銷必須提交，原本已完成的 Key 驗證用量仍留在帳本。
+    assert writes == [] and provider_script.requests == []
+    with answer_ready.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM login_sessions").fetchone() == (0,)
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (1,)
+        assert conn.execute(
+            "SELECT delivery FROM model_requests WHERE username = 'user'"
+        ).fetchone() == ("unsent",)
+
+
+# 工作階段若在等對話列鎖時到期，拒絕之前也不能讀取私人回答欄位。
+def test_get_expiry_after_conversation_lock_does_not_read_payload(
+    answer_ready: Settings,
+    provider_script: ProviderScript,
+    clock: list[datetime],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_script.responses.append(model_output(None, []))
+    actual = Connection.execute
+    payload_sql = "SELECT q.conversation_id, q.id, a.status, a.answer, a.citations"
+    private_reads: list[bool] = []
+
+    # 只記錄有沒有送出查詢，仍由 PostgreSQL 執行所有實際 SQL。
+    def observe_execute(
+        self: Connection[tuple[object, ...]],
+        query: str | bytes | SQL | Composed,
+        params: Params | None = None,
+        *,
+        prepare: bool | None = None,
+        binary: bool = False,
+    ) -> Cursor[tuple[object, ...]]:
+        if payload_sql in str(query):
+            private_reads.append(True)
+        return actual(self, query, params, prepare=prepare, binary=binary)
+
+    with (
+        TestClient(create_app(answer_ready), base_url=ORIGIN) as browser,
+        ThreadPoolExecutor(1) as pool,
+    ):
+        # 先用公開 API 建立回答，確認到期前仍能讀回相同結果。
+        login(browser)
+        prior = ask(browser)
+        assert prior.status_code == 200
+        path = f"{ANSWERS}/{prior.json()['attempt_id']}"
+        set_session_near_absolute_expiry(answer_ready, clock[0])
+        assert browser.get(path).json() == prior.json()
+        monkeypatch.setattr(Connection, "execute", observe_execute)
+
+        # 等 GET 真的被對話列鎖阻擋才跨過絕對期限，再讓查詢繼續。
+        with answer_ready.connect() as blocker:
+            blocker.execute("SELECT id FROM conversations FOR UPDATE")
+            pending = pool.submit(browser.get, path)
+            wait_for_search_lock(answer_ready, blocker.info.backend_pid)
+            clock[0] += timedelta(microseconds=1)
+        assert pending.result(timeout=5).status_code == 401
+
+    # 到期撤銷仍會提交，已保存的回答與模型用量也仍保留。
+    assert private_reads == []
+    assert len(provider_script.requests) == 1
+    with answer_ready.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM login_sessions").fetchone() == (0,)
+        status = conn.execute("SELECT status FROM answer_attempts").fetchone()
+        assert status == ("insufficient_evidence",)
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (2,)
+
+
+@pytest.mark.parametrize("readback", [False, True])
+# 最後一筆私人 SQL 完成後登入到期，已送出仍計次，未提交的回答須回滾。
+def test_absolute_session_expiry_during_final_answer_sql(
+    answer_ready: Settings,
+    provider_script: ProviderScript,
+    clock: list[datetime],
+    monkeypatch: pytest.MonkeyPatch,
+    readback: bool,
+) -> None:
+    assert import_batch(monkeypatch, ORIGINAL) == 0
+    provider_script.responses.extend(
+        [interaction("requires_action", CALL), model_output("私人回答。", [2])]
+    )
+    actual = Connection.execute
+    last_sql = (
+        "SELECT q.conversation_id, q.id, a.status"
+        if readback
+        else "UPDATE conversations SET last_seen_at = GREATEST(last_seen_at, %s) WHERE id = %s"
+    )
+
+    # 保留實際 PostgreSQL 查詢和交易，於終態查詢或活動時間寫入後推進時鐘。
+    def after_execute(
+        self: Connection[tuple[object, ...]],
+        query: str | bytes | SQL | Composed,
+        params: Params | None = None,
+        *,
+        prepare: bool | None = None,
+        binary: bool = False,
+    ) -> Cursor[tuple[object, ...]]:
+        cursor = actual(self, query, params, prepare=prepare, binary=binary)
+        if last_sql in str(query):
+            clock[0] += timedelta(microseconds=1)
+        return cursor
+
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        set_session_near_absolute_expiry(answer_ready, clock[0])
+        if readback:
+            result = ask(browser)
+            assert result.status_code == 200 and result.json()["answer"] == "私人回答。"
+        monkeypatch.setattr(Connection, "execute", after_execute)
+        denied = (
+            browser.get(f"{ANSWERS}/{result.json()['attempt_id']}")
+            if readback
+            else ask(browser)
+        )
+        assert denied.status_code == 401 and "私人回答" not in denied.text
+
+    # 讀取拒絕不抹除原本已提交的回答，寫入拒絕則不得保存私人內容或模型前文。
+    assert len(provider_script.requests) == 2
+    with answer_ready.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM login_sessions").fetchone() == (0,)
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (3,)
+        row = conn.execute(
+            "SELECT status, answer, search_results, model_steps IS NULL FROM answer_attempts"
+        ).fetchone()
+        if readback:
+            assert row == ("answered", "私人回答。", ORIGINAL_RESULTS["results"], False)
+        else:
+            assert row == ("stopped", None, [], True)
+
+
+@pytest.mark.parametrize("retry", [False, True])
+@pytest.mark.parametrize("same_session", [False, True])
+# 第一題仍在等終態列鎖時，任何工作階段都不能趁鎖釋放接著執行。
+def test_concurrent_post_remains_busy_during_final_write(
+    answer_ready: Settings,
+    provider_script: ProviderScript,
+    retry: bool,
+    same_session: bool,
+) -> None:
+    waiting, release = Event(), Event()
+
+    # 先等第一個模型請求送完，再扣住其嘗試列，讓正式完成交易阻塞在該列。
+    async def pending() -> httpx.Response:
+        waiting.set()
+        assert await anyio.to_thread.run_sync(release.wait, 5)
+        return model_output(None, [])
+
+    provider_script.responses.extend(
+        [pending, model_output(None, []), model_output(None, [])]
+    )
+    with (
+        TestClient(create_app(answer_ready), base_url=ORIGIN) as first,
+        TestClient(create_app(answer_ready), base_url=ORIGIN) as second,
+        ThreadPoolExecutor(2) as pool,
+    ):
+        login(first)
+        login(second)
+        competitor = first if same_session else second
+        original = pool.submit(ask, first)
+        try:
+            assert waiting.wait(4)
+            with answer_ready.connect() as blocker:
+                row = blocker.execute(
+                    """
+                    SELECT a.id, q.id, q.conversation_id FROM answer_attempts a
+                    JOIN questions q ON q.id = a.question_id FOR UPDATE OF a
+                    """
+                ).fetchone()
+                assert row is not None
+                attempt_id, question_id, conversation_id = map(str, row)
+                release.set()
+                wait_for_search_lock(answer_ready, blocker.info.backend_pid)
+                body = {"conversation_id": conversation_id}
+                if retry:
+                    body.update(question_id=question_id, attempt_id=attempt_id)
+                else:
+                    body["question"] = "並行追問"
+                duplicate = pool.submit(
+                    competitor.post, ANSWERS, headers=CSRF, json=body
+                )
+
+                # 首次交易持有對話鎖直到離開區塊。若舊行為開始排隊，先記錄後放鎖，讓測試得到真正的錯誤回應。
+                with answer_ready.connect() as observer:
+                    observer.autocommit = True
+                    limit = monotonic() + 2
+                    waited_query = (
+                        "%SELECT username, created_at, last_seen_at FROM login_sessions%"
+                        if same_session
+                        else "%SELECT created_at, last_seen_at, key_version FROM conversations%"
+                    )
+                    while not duplicate.done():
+                        blocked = observer.execute(
+                            """
+                            SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                                WHERE datname = current_database() AND query LIKE %s
+                                    AND cardinality(pg_blocking_pids(pid)) > 0)
+                            """,
+                            (waited_query,),
+                        ).fetchone()
+                        if blocked == (True,):
+                            break
+                        assert monotonic() < limit
+            assert original.result(timeout=5).status_code == 200
+            denied = duplicate.result(timeout=5)
+            assert denied.status_code == 409
+            assert denied.json() == {"detail": "這段對話正在處理問題，請稍後再試。"}
+            assert len(provider_script.requests) == 1
+            with answer_ready.connect() as conn:
+                assert conn.execute("SELECT count(*) FROM questions").fetchone() == (1,)
+                assert conn.execute(
+                    "SELECT count(*) FROM answer_attempts"
+                ).fetchone() == (1,)
+                assert conn.execute(
+                    "SELECT count(*) FROM model_requests"
+                ).fetchone() == (2,)
+
+            # 終態提交後明確再送一次可受理，證明忙碌拒絕未遺留狀態。
+            accepted = competitor.post(ANSWERS, headers=CSRF, json=body)
+            assert accepted.status_code == 200
+            assert accepted.json()["attempt_id"] != attempt_id
+            assert (accepted.json()["question_id"] == question_id) is retry
+        finally:
+            release.set()
+    assert len(provider_script.requests) == 2
+
+
+@pytest.mark.parametrize("precheck", [False, True])
+# 初始化與額度預留或忙碌快查真實重疊，兩邊都能完成且保留正確額度。
+def test_startup_during_business_quota_admission(
+    answer_ready: Settings,
+    provider_script: ProviderScript,
+    monkeypatch: pytest.MonkeyPatch,
+    precheck: bool,
+) -> None:
+    reached, go = Event(), Event()
+    backend_pids: list[int] = []
+    original_hint = answer_storage.busy_at_arrival
+
+    # 等到初始化真的受到目前交易阻擋才放行，避免靠執行速度猜測重疊。
+    def pause(conn: Connection[tuple[object, ...]]) -> None:
+        backend_pids.append(conn.info.backend_pid)
+        reached.set()
+        assert go.wait(5)
+
+    # 實際取得對話及執行列鎖後暫停，讓初始化確實等待這筆交易持有的表鎖。
+    def held(
+        conn: Connection[tuple[object, ...]], attempt: Attempt, deadline: float
+    ) -> AttemptWindow | None:
+        window = lock_running_attempt(conn, attempt, deadline)
+        pause(conn)
+        return window
+
+    # 只在已讀到忙碌提示後暫停；快查交易結束應先釋放表鎖再驗證登入。
+    def held_hint(
+        conn: Connection[tuple[object, ...]], digest: bytes, conversation: UUID
+    ) -> bool:
+        busy = original_hint(conn, digest, conversation)
+        pause(conn)
+        return busy
+
+    business_calls = 2 if precheck else 1
+    provider_script.responses.extend(
+        model_output(None, []) for _ in range(business_calls)
+    )
+    with (
+        TestClient(create_app(answer_ready), base_url=ORIGIN) as browser,
+        ThreadPoolExecutor(2) as pool,
+    ):
+        login(browser)
+        if precheck:
+            first = ask(browser)
+            assert first.status_code == 200
+            monkeypatch.setattr(answer_storage, "busy_at_arrival", held_hint)
+            answer = pool.submit(
+                browser.post,
+                ANSWERS,
+                headers=CSRF,
+                json={
+                    "question": QUESTION,
+                    "conversation_id": first.json()["conversation_id"],
+                },
+            )
+        else:
+            monkeypatch.setattr(answers, "lock_running_attempt", held)
+            answer = pool.submit(ask, browser)
+        try:
+            assert reached.wait(4)
+            init = pool.submit(initialize, answer_ready)
+            wait_for_search_lock(answer_ready, backend_pids[0])
+        finally:
+            go.set()
+        result = answer.result(timeout=6)
+        init.result(timeout=6)
+        assert (
+            result.status_code == 200
+            and result.json()["status"] == "insufficient_evidence"
+        )
+
+    assert len(provider_script.requests) == business_calls
+    with answer_ready.connect() as conn:
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (
+            business_calls + 1,
+        )
+        assert (
+            conn.execute(
+                "SELECT delivery FROM model_requests WHERE username = 'user'"
+            ).fetchall()
+            == [("sent",)] * business_calls
+        )
 
 
 # B 初次讀到 ready 後暫停，若 A 的拒絕先提交，B 不能寫出任何 HTTP 位元組。
@@ -1466,11 +2249,11 @@ def test_admitted_socket_write_finishes_before_rejection_without_holding_respons
     def observe_dispatch(
         settings: Settings,
         digest: bytes,
-        expected: Access,
+        attempt: Attempt,
         deadline: float,
     ) -> Dispatch:
-        dispatch = lock_dispatch(settings, digest, expected, deadline)
-        if expected.identity.username == "support":
+        dispatch = lock_dispatch(settings, digest, attempt, deadline)
+        if attempt.access.identity.username == "support":
             dispatch_pid.append(dispatch[0].info.backend_pid)
         return dispatch
 

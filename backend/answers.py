@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from threading import Event
 from time import monotonic
 from typing import cast
@@ -16,21 +16,27 @@ from google.genai._gaos.types.interactions import (
     ThoughtStep,
 )
 from psycopg import Connection
-from pydantic import Field, PositiveInt
+from pydantic import Field, PositiveInt, TypeAdapter
 from starlette.concurrency import run_in_threadpool
 
-from backend import knowledge
+from backend import knowledge, sessions
 from backend.answer_storage import (
+    SIGN_IN,
     AnswerDenied,
     AnswerResponse,
     Attempt,
     AttemptDeadline,
+    NewQuestion,
+    RetryQuestion,
     bound_transaction,
+    check_attempt_window,
     finish_attempt,
     lock_dispatch,
+    lock_running_attempt,
     mark_timed_out,
     record_delivery,
     require_time,
+    revoke_dispatch_session,
     search_attempt,
     start_attempt,
     stop_attempt,
@@ -44,8 +50,9 @@ MODEL_LIMIT = 3
 TOOL_LIMIT = 2
 
 
-class AnswerInput(knowledge.KnowledgeInput):
-    question: knowledge.PlainText = Field(max_length=2000)
+ANSWER_INPUT: TypeAdapter[NewQuestion | RetryQuestion] = TypeAdapter(
+    NewQuestion | RetryQuestion
+)
 
 
 class ModelAnswer(knowledge.KnowledgeInput):
@@ -57,13 +64,23 @@ class QuotaExhausted(Exception):
     pass
 
 
-# 預留交易不持有 Session 或啟用列鎖；提交後才允許 HTTP 寫入。
+# 預留交易不持有 Session 或啟用鎖；等待額度期間到期則回滾整筆預留。
 def reserve_business(
-    settings: Settings, request_id: UUID, username: str, deadline: float
+    settings: Settings, request_id: UUID, attempt: Attempt, deadline: float
 ) -> date | None:
     with settings.connect() as conn:
         bound_transaction(conn, deadline)
-        return reserve_request(conn, request_id, username=username)
+        # 共用預留先鎖額度及帳本，與初始化先帳本再對話的順序相容。
+        reserved_day = reserve_request(
+            conn, request_id, username=attempt.access.identity.username
+        )
+
+        # 仍在同一交易；被接手或到期時整筆回滾，帳本不會留下暫時預留。
+        bound_transaction(conn, deadline)
+        window = lock_running_attempt(conn, attempt, deadline)
+        check_attempt_window(window)
+        require_time(deadline)
+        return reserved_day
 
 
 @dataclass
@@ -89,7 +106,7 @@ class SendBoundary:
                 reserve_business,
                 self.settings,
                 self.request_id,
-                self.attempt.access.identity.username,
+                self.attempt,
                 self.deadline,
             )
             if reserved_day is None:
@@ -97,23 +114,36 @@ class SendBoundary:
             self.reserved = True
 
             # 預留與資料庫鎖均可能等待，必須在最後一把鎖後重新確認授權。
-            self.connection, self.sequence, wire_deadline = await run_in_threadpool(
+            (
+                connection,
+                self.sequence,
+                wire_deadline,
+                session_expiry,
+            ) = await run_in_threadpool(
                 lock_dispatch,
                 self.settings,
                 self.digest,
-                self.attempt.access,
+                self.attempt,
                 self.deadline,
             )
+            self.connection = connection
             await anyio.lowlevel.checkpoint()
 
-            # 最後一次非同步等待後，跨日或換 Key 的已預留請求仍可安全取消。
+            # 最後一次非同步等待後，換 Key、跨日或登入到期都只能退回尚未送出的預留。
             try:
                 current_key = read_key(self.settings.key_file)
             except CredentialError:
                 current_key = None
+            wire_day = service_day_now()
+            if sessions.utc_now() >= session_expiry:
+                with anyio.CancelScope(shield=True):
+                    await run_in_threadpool(
+                        revoke_dispatch_session, connection, self.digest
+                    )
+                raise AnswerDenied(401, SIGN_IN)
             if current_key != self.attempt.access.key:
                 raise AnswerDenied(503, "Gemini 設定已變更，請重新提出問題。")
-            if service_day_now() != reserved_day:
+            if wire_day != reserved_day:
                 raise QuotaExhausted
             require_time(wire_deadline)
 
@@ -250,13 +280,14 @@ async def run_attempt(
     settings: Settings,
     digest: bytes,
     attempt: Attempt,
-    question: str,
     response: AnswerResponse,
     deadline: float,
-) -> None:
-    history: list[StepParam] = [
-        {"type": "user_input", "content": [{"type": "text", "text": question}]}
-    ]
+) -> list[StepParam] | None:
+    # 前文取自資料庫；本題工具證據與已執行工具數量都從空白開始。
+    history = list(attempt.history)
+    history.append(
+        {"type": "user_input", "content": [{"type": "text", "text": attempt.question}]}
+    )
     calls_seen: set[str] = set()
 
     # 每輪只可能有一次網路請求，配額或供應商錯誤立即停止。
@@ -269,18 +300,18 @@ async def run_attempt(
                 if exchange.failure == "credential_rejected"
                 else exchange.failure
             )
-            return
+            return None
 
         # 拒絕未完成或無法原樣回傳的步驟；不接受模型自己產生的工具結果。
         raw = received_steps(exchange)
         steps = result.steps or []
         if len(steps) != len(raw):
-            return
+            return None
         for step, value in zip(steps, raw, strict=True):
             if not isinstance(step, (ThoughtStep, FunctionCallStep, ModelOutputStep)):
-                return
+                return None
             if step.model_dump(mode="json", by_alias=True, exclude_unset=True) != value:
-                return
+                return None
 
         # 忽略思考內容的語義，但後續傳輸必須完整保留原順序及簽章。
         actions = [step for step in steps if not isinstance(step, ThoughtStep)]
@@ -290,15 +321,17 @@ async def run_attempt(
             and isinstance(actions[0], ModelOutputStep)
         ):
             resolve_answer(actions[0], response.search_results, response)
-            return
+            # 保存單題的完整交換；前文不重複寫入下一題。
+            history.extend(cast(list[StepParam], raw))
+            return history[len(attempt.history) :]
         if (
             result.status != "requires_action"
             or not actions
             or request_index + 1 >= MODEL_LIMIT
         ):
-            return
+            return None
         if len(calls_seen) + len(actions) > TOOL_LIMIT:
-            return
+            return None
 
         # 名稱、參數及呼叫 ID 全部通過才進入資料庫；重複 ID 不能冒用結果。
         batch: list[tuple[str, str]] = []
@@ -311,7 +344,7 @@ async def run_attempt(
                 or len(action.id) > 256
                 or action.id in calls_seen
             ):
-                return
+                return None
             query = knowledge.SearchInput.model_validate(action.arguments).query.strip()
             calls_seen.add(action.id)
             batch.append((action.id, query))
@@ -330,14 +363,22 @@ async def run_attempt(
                     "result": [{"type": "text", "text": output}],
                 }
             )
+    return None
 
 
 # 總期限涵蓋同一嘗試的所有外呼與工具；終止後只結算，不允許背景改寫答案。
 async def ask(
-    settings: Settings, digest: bytes, question: str, disconnected: Event
+    settings: Settings,
+    digest: bytes,
+    form: NewQuestion | RetryQuestion,
+    disconnected: Event,
 ) -> AnswerResponse:
+    # 單調時間控制本程序；UTC 期限讓其他程序只接手確定已逾期的嘗試。
+    deadline_at = datetime.now(UTC) + timedelta(seconds=ATTEMPT_SECONDS)
     deadline = monotonic() + ATTEMPT_SECONDS
-    attempt = await run_in_threadpool(start_attempt, settings, digest, question)
+    attempt = await run_in_threadpool(
+        start_attempt, settings, digest, form, deadline_at
+    )
     response = AnswerResponse(
         conversation_id=attempt.conversation_id,
         question_id=attempt.question_id,
@@ -347,12 +388,13 @@ async def ask(
         search_results=[],
     )
     finished = False
+    model_steps = None
     try:
         # 只取消本次操作；送達結算及終態寫入在期限取消後仍可完成。
         with anyio.move_on_after(max(0, deadline - monotonic())) as timeout:
             try:
-                await run_attempt(
-                    settings, digest, attempt, question, response, deadline
+                model_steps = await run_attempt(
+                    settings, digest, attempt, response, deadline
                 )
             except AttemptDeadline:
                 mark_timed_out(response)
@@ -368,7 +410,14 @@ async def ask(
 
         # 最後一次持鎖確認擁有者、啟用及期限，拒絕任何過期的私人交付。
         await run_in_threadpool(
-            finish_attempt, settings, digest, attempt, response, deadline, disconnected
+            finish_attempt,
+            settings,
+            digest,
+            attempt,
+            response,
+            model_steps,
+            deadline,
+            disconnected,
         )
         finished = True
         await anyio.lowlevel.checkpoint()

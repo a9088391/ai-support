@@ -152,6 +152,7 @@ p {
 .status-content h2,
 .operator-guidance h2,
 .auth-card h1,
+.answer-workspace h2,
 .knowledge-search h2,
 .knowledge-search-state h3,
 .knowledge-search-feedback h3,
@@ -447,8 +448,39 @@ p {
   overflow-wrap: anywhere;
 }
 
-.answer-workspace h4 {
+.answer-form,
+.answer-secondary-action {
+  margin-top: 0.85rem;
+}
+
+.answer-form .answer-secondary-action {
+  margin-top: 0;
+}
+
+.answer-secondary-action {
+  justify-self: start;
+  color: var(--cyan);
+  background: #fff;
+}
+
+.answer-secondary-action:hover:not(:disabled) {
+  background: #eaf3f5;
+}
+
+.answer-history {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.answer-history h4,
+.answer-history h5 {
   margin: 1.2rem 0 0;
+  font-size: 1rem;
+}
+
+.answer-history .knowledge-search-feedback h4 {
+  margin: 0;
 }
 
 .knowledge-results {

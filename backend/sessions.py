@@ -213,10 +213,18 @@ def active_session(
         return read_active_session(conn, digest, refresh=refresh)
 
 
-# 呼叫端的交易持有同一列鎖，讓檢查、讀取或刷新與登出依序完成。
+# 既有呼叫端只需公開身分；登入期限不進 HTTP 回應。
 def read_active_session(
     conn: psycopg.Connection[tuple[object, ...]], digest: bytes, *, refresh: bool
 ) -> Identity | None:
+    session = read_locked_session(conn, digest, refresh=refresh)
+    return session[0] if session is not None else None
+
+
+# 呼叫端持有同一列鎖，並取得不含秘密的到期時間供送出前再次比對。
+def read_locked_session(
+    conn: psycopg.Connection[tuple[object, ...]], digest: bytes, *, refresh: bool
+) -> tuple[Identity, datetime] | None:
     # 先取得列鎖，避免用等待期間已經過時的時間接受逾期工作階段。
     row = conn.execute(
         """
@@ -231,7 +239,8 @@ def read_active_session(
     # 共用期限；首次觀察到期即刪除，避免時鐘回撥恢復憑證。
     username, created_at, last_seen_at = cast(tuple[Role, datetime, datetime], row)
     at = utc_now()
-    if last_seen_at <= at - SESSION_IDLE or created_at <= at - SESSION_MAX:
+    absolute_expiry = created_at + SESSION_MAX
+    if at >= min(last_seen_at + SESSION_IDLE, absolute_expiry):
         revoke_session(conn, digest)
         return None
 
@@ -241,7 +250,10 @@ def read_active_session(
             "UPDATE login_sessions SET last_seen_at = %s WHERE token_digest = %s",
             (at, digest),
         )
-    return Identity(username=username, role=username)
+        last_seen_at = at
+    return Identity(username=username, role=username), min(
+        last_seen_at + SESSION_IDLE, absolute_expiry
+    )
 
 
 # 登出與換發共用刪除操作；不存在的憑證可安全重送。

@@ -257,7 +257,7 @@ def create_app(settings: Settings | None = None, static: Path = STATIC) -> FastA
         ):
             raise HTTPException(status_code=422, detail=ANSWER_INVALID)
         try:
-            form = answers.AnswerInput.model_validate(
+            form = answers.ANSWER_INPUT.validate_python(
                 knowledge.parse_json(await request.body())
             )
         except (ValueError, RecursionError):
@@ -277,7 +277,7 @@ def create_app(settings: Settings | None = None, static: Path = STATIC) -> FastA
                     return await answers.ask(
                         request.app.state.settings,
                         digest,
-                        form.question.strip(),
+                        form,
                         disconnected,
                     )
                 finally:

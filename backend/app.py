@@ -1,9 +1,7 @@
-import asyncio
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager, suppress
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from ipaddress import ip_address
 from pathlib import Path
-from threading import Event
 from uuid import UUID
 
 import anyio
@@ -15,14 +13,16 @@ from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import RequestResponseEndpoint
 
-from backend import answers, knowledge, sessions
+from backend import answers, knowledge, sessions, tickets
 from backend.activation import setup_status
 from backend.answer_storage import (
     AnswerDenied,
     AnswerResponse,
+    parse_answer_id,
     purge_expired,
     read_attempt,
 )
+from backend.answer_stream import ANSWER_UNAVAILABLE, NDJSON, AnswerStream, run_answer
 from backend.credentials import CredentialError
 from backend.database import Settings, initialize
 from backend.http_security import LOCAL_HOSTS, ApiRequestMiddleware
@@ -32,6 +32,8 @@ LOGIN_INVALID = "登入欄位格式不正確。"
 LOGIN_DENIED = "帳號或密碼不正確。"
 SEARCH_INVALID = "搜尋欄位格式不正確。"
 ANSWER_INVALID = "問題欄位格式不正確。"
+TICKET_INVALID = "工單欄位格式不正確。"
+TICKET_PAGE_INVALID = "工單分頁參數格式不正確。"
 PURGE_INTERVAL_SECONDS = 240
 
 
@@ -43,14 +45,57 @@ def login_source(request: Request) -> str:
         return "unknown"
 
 
-# 等待瀏覽器斷線；取消操作本身，讓模型與配額結算沿同一條路徑收尾。
-async def watch_answer_disconnect(
-    request: Request, stop: anyio.CancelScope, disconnected: Event
-) -> None:
-    while (await request.receive())["type"] != "http.disconnect":
-        pass
-    disconnected.set()
-    stop.cancel()
+# 只從受保護的 Cookie 取得工作階段摘要；資料庫仍須確認身分與期限。
+def request_digest(request: Request) -> bytes:
+    digest = sessions.token_digest(request.cookies.get(sessions.COOKIE_NAME))
+    if digest is None:
+        raise HTTPException(status_code=401, detail="請先登入。")
+    return digest
+
+
+# 只接受明確的 JSON 型別及唯一欄位；各操作使用固定錯誤文案。
+async def read_json(request: Request, detail: str) -> object:
+    types = request.headers.getlist("content-type")
+    if (
+        len(types) != 1
+        or types[0].split(";", 1)[0].strip().lower() != "application/json"
+    ):
+        raise HTTPException(status_code=422, detail=detail)
+    try:
+        return knowledge.parse_json(await request.body())
+    except (ValueError, RecursionError):
+        raise HTTPException(status_code=422, detail=detail) from None
+
+
+# 每個數值只可傳一次；先檢查字元及長度，避免轉換任意長度整數。
+def ticket_page_number(
+    request: Request, name: str, *, default: int, minimum: int, maximum: int
+) -> int:
+    values = request.query_params.getlist(name)
+    if not values:
+        return default
+    value = values[0]
+    if (
+        len(values) != 1
+        or len(value) > 10
+        or not (value.isascii() and value.isdecimal())
+    ):
+        raise HTTPException(status_code=422, detail=TICKET_PAGE_INVALID)
+    number = int(value)
+    if not minimum <= number <= maximum:
+        raise HTTPException(status_code=422, detail=TICKET_PAGE_INVALID)
+    return number
+
+
+@contextmanager
+# 工單各入口共用固定的拒絕回應，不回顯資料庫診斷或私人資料。
+def ticket_http_errors() -> Iterator[None]:
+    try:
+        yield
+    except AnswerDenied as error:
+        raise HTTPException(status_code=error.code, detail=error.detail) from None
+    except psycopg.Error:
+        raise HTTPException(status_code=503, detail="目前無法處理工單。") from None
 
 
 # 以有界交易定期刪除已到期暫存；短暫資料庫錯誤不會停止 HTTP 或解除到期限制。
@@ -250,56 +295,32 @@ def create_app(settings: Settings | None = None, static: Path = STATIC) -> FastA
     # 問答只接受本次問題；HTTP 斷線即取消工作，不繼續向模型送出後續步驟。
     async def submit_answer(request: Request) -> AnswerResponse | Response:
         # 中介層先驗證同源及大小；拒絕重複欄位與任何聲稱的前文。
-        types = request.headers.getlist("content-type")
-        if (
-            len(types) != 1
-            or types[0].split(";", 1)[0].strip().lower() != "application/json"
-        ):
-            raise HTTPException(status_code=422, detail=ANSWER_INVALID)
         try:
             form = answers.ANSWER_INPUT.validate_python(
-                knowledge.parse_json(await request.body())
+                await read_json(request, ANSWER_INVALID)
             )
-        except (ValueError, RecursionError):
+        except ValidationError:
             raise HTTPException(status_code=422, detail=ANSWER_INVALID) from None
-        digest = sessions.token_digest(request.cookies.get(sessions.COOKIE_NAME))
-        if digest is None:
-            raise HTTPException(status_code=401, detail="請先登入。")
+        digest = request_digest(request)
 
-        # 資料庫存取及模型寫入會重新驗證身分；監看工作只存活到本次請求完成。
+        # 只有明確要求 NDJSON 的用戶端才收到受理事件；原本 JSON 契約保留。
+        if request.headers.get("accept") == NDJSON:
+            return AnswerStream(digest, form)
+
+        # 兩種回應共用真實斷線和模型收尾；既有 HTTP 錯誤保持原格式。
         try:
-            with anyio.CancelScope() as stop:
-                disconnected = Event()
-                observer = asyncio.create_task(
-                    watch_answer_disconnect(request, stop, disconnected)
-                )
-                try:
-                    return await answers.ask(
-                        request.app.state.settings,
-                        digest,
-                        form,
-                        disconnected,
-                    )
-                finally:
-                    # 即使已斷線也等待監看工作停止，避免遺留接收者。
-                    observer.cancel()
-                    with (
-                        anyio.CancelScope(shield=True),
-                        suppress(asyncio.CancelledError),
-                    ):
-                        await observer
+            return await run_answer(request, digest, form)
         except AnswerDenied as error:
+            if error.code == 499:
+                return Response(status_code=499)
             raise HTTPException(status_code=error.code, detail=error.detail) from None
         except psycopg.Error:
-            raise HTTPException(status_code=503, detail="目前無法完成問答。") from None
-        return Response(status_code=499)
+            raise HTTPException(status_code=503, detail=ANSWER_UNAVAILABLE) from None
 
     @app.get("/api/answers/{attempt_id}")
     # 依不透明嘗試識別讀回已完成的自有結果；不延長閒置期限。
     def get_answer(request: Request, attempt_id: str) -> AnswerResponse:
-        digest = sessions.token_digest(request.cookies.get(sessions.COOKIE_NAME))
-        if digest is None:
-            raise HTTPException(status_code=401, detail="請先登入。")
+        digest = request_digest(request)
 
         # 畸形識別和找不到資料共用固定回覆，不回顯路徑內容。
         try:
@@ -312,6 +333,60 @@ def create_app(settings: Settings | None = None, static: Path = STATIC) -> FastA
             raise HTTPException(status_code=error.code, detail=error.detail) from None
         except psycopg.Error:
             raise HTTPException(status_code=503, detail="目前無法查詢問答。") from None
+
+    @app.post("/api/tickets")
+    # 只接受原題、預期嘗試和描述；回答及來源一律由資料庫擷取。
+    async def create_ticket(request: Request) -> tickets.TicketDetail:
+        # 沿用同源與本文防護，驗證錯誤不回顯收到的欄位。
+        try:
+            form = tickets.TicketInput.model_validate(
+                await read_json(request, TICKET_INVALID)
+            )
+        except ValidationError:
+            raise HTTPException(status_code=422, detail=TICKET_INVALID) from None
+        digest = request_digest(request)
+
+        # 等候交易不阻塞事件迴圈；原次重送和首次成功回傳同一種 DTO。
+        with ticket_http_errors():
+            return await run_in_threadpool(
+                tickets.create_ticket, request.app.state.settings, digest, form
+            )
+
+    @app.get("/api/tickets")
+    # 一般使用者與客服目前都只能看自己的工單，最多每頁 100 筆。
+    def list_tickets(request: Request) -> tickets.TicketPage:
+        # 先驗證分頁形狀，不讓重複或不支援的參數影響查詢。
+        digest = request_digest(request)
+        if set(request.query_params) - {"limit", "offset"}:
+            raise HTTPException(status_code=422, detail=TICKET_PAGE_INVALID)
+        limit = ticket_page_number(
+            request,
+            "limit",
+            default=tickets.PAGE_LIMIT,
+            minimum=1,
+            maximum=tickets.PAGE_LIMIT,
+        )
+        offset = ticket_page_number(
+            request, "offset", default=0, minimum=0, maximum=tickets.OFFSET_LIMIT
+        )
+
+        # 分頁與最終授權在同一資料庫交易。
+        with ticket_http_errors():
+            return tickets.list_tickets(
+                request.app.state.settings, digest, limit, offset
+            )
+
+    @app.get("/api/tickets/{ticket_id}")
+    # 工單明細使用不透明識別，並按目前工作階段的建立人篩選。
+    def get_ticket(request: Request, ticket_id: str) -> tickets.TicketDetail:
+        # 畸形識別不回顯，與不存在或不屬於本人的識別共用 404。
+        digest = request_digest(request)
+        try:
+            identifier = parse_answer_id(ticket_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail=tickets.NOT_FOUND) from None
+        with ticket_http_errors():
+            return tickets.read_ticket(request.app.state.settings, digest, identifier)
 
     @app.get("/health")
     # 提供不會接觸模型的本機存活檢查。

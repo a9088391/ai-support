@@ -153,6 +153,7 @@ p {
 .operator-guidance h2,
 .auth-card h1,
 .answer-workspace h2,
+.ticket-workspace h2,
 .knowledge-search h2,
 .knowledge-search-state h3,
 .knowledge-search-feedback h3,
@@ -340,23 +341,23 @@ p {
   gap: 0.35rem;
 }
 
-.nav-current {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  min-height: 2.7rem;
+.workbench-nav-action {
+  width: 100%;
   padding: 0.55rem 0.65rem;
-  border-radius: 0.5rem;
-  color: #fff;
-  background: #2b495d;
-  font-weight: 650;
+  border-color: transparent;
+  color: #edf4f7;
+  background: transparent;
+  text-align: left;
 }
 
-.nav-indicator {
-  width: 0.45rem;
-  height: 0.45rem;
-  border-radius: 50%;
-  background: #5bc1cb;
+.workbench-nav-action[aria-current="page"] {
+  border-inline-start-color: #5bc1cb;
+  color: #fff;
+  background: #2b495d;
+}
+
+.workbench-nav-action:hover:not(:disabled) {
+  background: #2b495d;
 }
 
 .rail-account {
@@ -403,6 +404,7 @@ p {
 }
 
 .answer-workspace,
+.ticket-workspace,
 .knowledge-search {
   max-width: 42rem;
   margin-top: 2rem;
@@ -481,6 +483,35 @@ p {
 
 .answer-history .knowledge-search-feedback h4 {
   margin: 0;
+}
+
+.ticket-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+}
+
+.ticket-list {
+  margin: 0 0 0.75rem;
+  padding: 0;
+  list-style: none;
+}
+
+.ticket-list .ticket-summary-text {
+  display: -webkit-box;
+  margin-bottom: 0.65rem;
+  overflow: hidden;
+  font-weight: 650;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.ticket-snapshot {
+  margin-top: 1rem;
+}
+
+.ticket-snapshot h4 {
+  margin: 1rem 0 0;
 }
 
 .knowledge-results {

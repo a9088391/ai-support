@@ -1,22 +1,44 @@
 <script setup lang="ts">
 import type { KnowledgeSearchResult } from "~/components/KnowledgeResultList.vue";
+import {
+  NDJSON,
+  readAnswerStream,
+  type ApiResult,
+} from "~/workbench/answer-stream";
+import {
+  SETUP_MODEL,
+  INVALID_PLAIN_TEXT_CHARACTER,
+  BLANK_PLAIN_TEXT,
+  answerStatusMessages,
+  asRecord,
+  isAnswerIdentity,
+  isKnowledgeSearchResult,
+  readAnswerOutput,
+  readTicketDetail,
+  readTicketPage,
+  sameAnswerAttempt,
+  ticketTime,
+  type AnswerEvidence,
+  type AnswerIdentity,
+  type AnswerOutput,
+  type Role,
+  type TicketDetail,
+  type TicketPage,
+} from "~/workbench/contracts";
 
-const SETUP_MODEL = "gemini-3.5-flash-lite" as const;
 const REQUEST_TIMEOUT_MS = 10_000;
 // 模型嘗試最多六十秒，另外保留傳輸與後端結算時間。
 const ANSWER_REQUEST_TIMEOUT_MS = 75_000;
 const LOGOUT_UNCONFIRMED = "目前無法確認登出結果，請手動重試登出。";
 const MAX_KNOWLEDGE_QUERY_CODE_POINTS = 2_000;
 const MAX_QUESTION_CODE_POINTS = 2_000;
-const MAX_ANSWER_SOURCES = 40;
 const MAX_CONVERSATION_QUESTIONS = 10;
+const MAX_TICKET_DESCRIPTION_CODE_POINTS = 4_000;
+const TICKET_PAGE_SIZE = 20;
+const TICKET_WRITE_UNCONFIRMED =
+  "目前無法確認建單結果，已保留問題描述。可先查看我的工單，或手動重送；若已建單，重送會讀回原工單。";
 const ANSWER_LIMIT_MESSAGE = "這段對話已達 10 題上限，請開始新的對話。";
 const ANSWER_KEY_CHANGED = "Gemini 設定已變更，請重新提出問題。";
-const ANSWER_ID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
-// 與後端純文字契約一致，保留定位字元、換行與完整的代理字元對。
-const INVALID_QUESTION_CHARACTER =
-  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\ud800-\udfff]/u;
-const BLANK_PLAIN_TEXT = /^[\p{Z}\t\n\r]*$/u;
 const setupStatuses = [
   "unconfigured",
   "unverified",
@@ -25,7 +47,6 @@ const setupStatuses = [
 ] as const;
 
 type SetupStatus = (typeof setupStatuses)[number];
-type Role = "user" | "support";
 type AuthState = "checking" | "signed-out" | "signed-in" | "error";
 
 interface SetupDto {
@@ -43,25 +64,6 @@ interface KnowledgeSearchDto {
   readonly results: readonly KnowledgeSearchResult[];
 }
 
-const answerStatusMessages = {
-  answered: "",
-  insufficient_evidence: "本次搜尋沒有足夠依據回答這個問題。",
-  invalid_output: "本次回答未通過驗證。您可以查看已取得的搜尋結果。",
-  rate_limited: "模型請求已達額度或速率上限，請稍後再手動重試。",
-  timed_out: "本次問答已逾時。您可以查看已取得的搜尋結果。",
-  unavailable: "模型暫時無法使用，請稍後再手動重試。",
-} as const;
-
-interface AnswerOutput {
-  readonly conversation_id: string;
-  readonly question_id: string;
-  readonly attempt_id: string;
-  readonly status: keyof typeof answerStatusMessages;
-  readonly answer: string | null;
-  readonly citations: readonly KnowledgeSearchResult[];
-  readonly search_results: readonly KnowledgeSearchResult[];
-}
-
 interface AnswerNotice {
   readonly message: string;
   readonly block: "conversation" | "new-question" | "retry" | null;
@@ -69,7 +71,11 @@ interface AnswerNotice {
 
 interface AnswerEntry {
   readonly question: string;
-  readonly output: AnswerOutput;
+  readonly output: AnswerIdentity &
+    AnswerEvidence & {
+      readonly status:
+        AnswerOutput["status"] | "stopped" | "running" | "unconfirmed";
+    };
   readonly notice?: AnswerNotice;
 }
 
@@ -82,12 +88,12 @@ interface Operation {
 
 interface AnswerOperation extends Operation {
   readonly retry: AnswerEntry | null;
+  admission: AnswerIdentity | null;
 }
 
-interface ApiResult {
-  readonly status: number | null;
-  readonly data: unknown;
-  readonly retryAfter: string | null;
+interface TicketEditor {
+  readonly question: string;
+  readonly source: AnswerIdentity;
 }
 
 const statusTitles: Record<SetupStatus, string> = {
@@ -122,7 +128,27 @@ const answerNotice = shallowRef<AnswerNotice | null>(null);
 const answerEntries = shallowRef<readonly AnswerEntry[]>([]);
 const seenAnswerAttempts = new Set<string>();
 const answerOperation = shallowRef<AnswerOperation | null>(null);
+let admittedQuestionDraft: AnswerIdentity | null = null;
 const answerQuestionInput = ref<HTMLTextAreaElement | null>(null);
+const answerWorkspace = ref<HTMLElement | null>(null);
+const ticketView = ref<"workbench" | "list" | "detail">("workbench");
+const ticketEditor = shallowRef<TicketEditor | null>(null);
+const ticketDescription = ref("");
+let unconfirmedTicketDescription: string | null = null;
+const ticketFormError = ref("");
+const ticketDescriptionInvalid = ref(false);
+const ticketWrite = shallowRef<Operation | null>(null);
+const ticketRead = shallowRef<Operation | null>(null);
+const ticketPage = shallowRef<TicketPage | null>(null);
+const ticketOffset = ref(0);
+const ticketDetailId = ref<string | null>(null);
+const ticketDetail = shallowRef<TicketDetail | null>(null);
+const ticketReadError = ref("");
+const ticketCreated = ref(false);
+const ticketDescriptionInput = ref<HTMLTextAreaElement | null>(null);
+const ticketFormFeedback = ref<HTMLElement | null>(null);
+const ticketHeading = ref<HTMLElement | null>(null);
+const ticketReadFeedback = ref<HTMLElement | null>(null);
 const usernameInput = ref<HTMLInputElement | null>(null);
 const passwordInput = ref<HTMLInputElement | null>(null);
 const knowledgeQueryInput = ref<HTMLInputElement | null>(null);
@@ -150,7 +176,7 @@ const isServiceReady = computed(
     !hasSetupError.value &&
     setupStatus.value?.status === "ready",
 );
-// 只用已確認的終態計入畫面題數；伺服器回報達限時也停止收新題。
+// 只用伺服器已受理的問題計入題數；重試替換同一題。
 const isAnswerAtLimit = computed(
   () =>
     answerEntries.value.length >= MAX_CONVERSATION_QUESTIONS ||
@@ -160,7 +186,7 @@ const isAnswerAtLimit = computed(
 const isAnswerConversationBlocked = computed(
   () => answerNotice.value?.block === "conversation",
 );
-// 工作台標題直接依伺服器回傳角色顯示，不建立額外導航狀態。
+// 工作台標題直接依伺服器回傳角色顯示。
 const roleTitle = computed(() =>
   identity.value?.role === "user" ? "一般使用者" : "客服",
 );
@@ -264,116 +290,6 @@ function isKnowledgeSearchDto(value: unknown): value is KnowledgeSearchDto {
 
   // 逐筆拒絕非物件、額外欄位或非文字片段。
   return dto.results.every(isKnowledgeSearchResult);
-}
-
-// 搜尋及問答共用相同的片段欄位；各自的筆數上限由外層回應驗證。
-function isKnowledgeSearchResult(item: unknown): item is KnowledgeSearchResult {
-  // 先拒絕陣列與 null，再檢查結果欄位。
-  // prettier-ignore
-  if (
-    typeof item !== "object"
-    || item === null
-    || Array.isArray(item)
-  ) {
-    return false;
-  }
-
-  const result = item as Record<string, unknown>;
-
-  // 每筆只接受 API 定義的五個純文字欄位。
-  // prettier-ignore
-  return (
-    Object.keys(result).length === 5
-    && typeof result.document_id === "string"
-    && typeof result.title === "string"
-    && typeof result.version === "string"
-    && typeof result.fragment_id === "string"
-    && typeof result.excerpt === "string"
-  );
-}
-
-// 只接受後端產生的不透明識別，供目前頁面追問與重試。
-function isAnswerId(value: unknown): value is string {
-  return typeof value === "string" && ANSWER_ID.test(value);
-}
-
-// 確認問答終態與本次證據相符，僅保留畫面使用的欄位。
-function readAnswerOutput(value: unknown): AnswerOutput | null {
-  // 拒絕非物件的回應，再檢查固定外形。
-  // prettier-ignore
-  if (
-    typeof value !== "object"
-    || value === null
-    || Array.isArray(value)
-  ) {
-    return null;
-  }
-  const dto = value as Record<string, unknown>;
-  const { status, answer, citations, search_results } = dto;
-
-  // 未知狀態、模型、識別或片段不進入私人工作區。
-  // prettier-ignore
-  if (
-    Object.keys(dto).length !== 8
-    || !isAnswerId(dto.conversation_id)
-    || !isAnswerId(dto.question_id)
-    || !isAnswerId(dto.attempt_id)
-    || dto.model !== SETUP_MODEL
-    || typeof status !== "string"
-    || !Object.hasOwn(answerStatusMessages, status)
-    || !Array.isArray(citations)
-    || citations.length > MAX_ANSWER_SOURCES
-    || !citations.every(isKnowledgeSearchResult)
-    || !Array.isArray(search_results)
-    || search_results.length > MAX_ANSWER_SOURCES
-    || !search_results.every(isKnowledgeSearchResult)
-  ) {
-    return null;
-  }
-
-  // 以完整來源快照核對引用，允許同一片段在不同版本各自出現。
-  if (status === "answered") {
-    // 以完整欄位依序比對，不受 JSON 物件的欄位順序影響。
-    const sourceKey = (source: KnowledgeSearchResult) =>
-      JSON.stringify([
-        source.document_id,
-        source.title,
-        source.version,
-        source.fragment_id,
-        source.excerpt,
-      ]);
-    const sources = new Set(search_results.map(sourceKey));
-    const citedSources = new Set(citations.map(sourceKey));
-
-    // 成功回答須有文字及至少一筆唯一引用，且每筆都來自這次搜尋。
-    // prettier-ignore
-    if (
-      typeof answer !== "string"
-      || BLANK_PLAIN_TEXT.test(answer)
-      || citations.length === 0
-      || citedSources.size !== citations.length
-      || ![...citedSources].every(
-        // 拒絕搜尋快照未包含的引用，避免將其他來源呈現為本次證據。
-        (key) => sources.has(key),
-      )
-    ) {
-      return null;
-    }
-  } else if (answer !== null || citations.length !== 0) {
-    // 失敗回應只允許帶搜尋結果，不能帶未驗證的回答或引用。
-    return null;
-  }
-
-  // 只保留核對過的識別與內容，供本頁的後續操作使用。
-  return {
-    conversation_id: dto.conversation_id,
-    question_id: dto.question_id,
-    attempt_id: dto.attempt_id,
-    status: status as AnswerOutput["status"],
-    answer,
-    citations,
-    search_results,
-  };
 }
 
 // 只讀取安全狀態與限流標頭，不顯示伺服器錯誤本文或診斷內容。
@@ -1023,6 +939,7 @@ function clearAnswer(keepDraft = false): void {
   answerQuestionError.value = "";
   answerNotice.value = null;
   answerEntries.value = [];
+  admittedQuestionDraft = null;
   seenAnswerAttempts.clear();
 }
 
@@ -1034,6 +951,7 @@ function startNewConversation(): void {
     !isServiceReady.value
     || !identity.value
     || answerOperation.value
+    || ticketEditor.value
   ) {
     return;
   }
@@ -1053,6 +971,31 @@ function clearPageBusinessState(): void {
   cancelKnowledgeSearch();
   knowledgeQuery.value = "";
   clearAnswer();
+  clearTickets();
+}
+
+// 離開時也撤銷認證讀取；快取還原後不沿用離開前的身分。
+function handlePageHide(): void {
+  // 撤銷操作再清空狀態，避免舊回應在頁面返回後套用。
+  const operation = activeOperation.value;
+  activeOperation.value = null;
+  operation?.controller.abort();
+  clearPageBusinessState();
+
+  // 快取頁面先隱藏私人區域，返回時再讀取啟用與身分。
+  setupStatus.value = null;
+  identity.value = null;
+  authState.value = "checking";
+  authMessage.value = "";
+}
+
+// 從瀏覽器快取返回時重新確認身分，不延長閒置期限或復原舊對話。
+function handlePageShow(event: PageTransitionEvent): void {
+  if (event.persisted) {
+    void refreshSetupStatus();
+  } else {
+    void checkSetupOnForeground();
+  }
 }
 
 // 只有原本的登入身分與等待操作可以接收本次問答。
@@ -1061,6 +1004,7 @@ function isCurrentAnswer(operation: Operation, owner: IdentityDto): boolean {
   // prettier-ignore
   return (
     answerOperation.value === operation
+    && !operation.controller.signal.aborted
     && isServiceReady.value
     && identity.value === owner
   );
@@ -1077,12 +1021,18 @@ function validateQuestion(question: string): string {
   }
 
   // 無效控制字元及未配對的代理字元不可送往後端。
-  if (INVALID_QUESTION_CHARACTER.test(question)) {
+  if (INVALID_PLAIN_TEXT_CHARACTER.test(question)) {
     return "問題包含無法使用的字元，請修正後再提出。";
   }
 
   // 拒絕後端視為空白的文字，避免對空問題送出問答請求。
   return BLANK_PLAIN_TEXT.test(question) ? "請輸入您的問題。" : "";
+}
+
+// 草稿一經編輯便與先前的問答脫鉤，遲到的建單不得清除新的文字。
+function handleAnswerQuestionInput(): void {
+  admittedQuestionDraft = null;
+  answerQuestionError.value = "";
 }
 
 // 僅辨識問答契約的固定錯誤；其他回應不能證明送出是否已生效。
@@ -1146,7 +1096,7 @@ function readAnswerFailure(result: ApiResult, isRetry: boolean): AnswerNotice {
 
 // 驗證終態識別屬於本次操作，並拒絕重複採用已看過的嘗試。
 function matchesAnswerOperation(
-  output: AnswerOutput,
+  output: AnswerIdentity,
   conversationId: string | undefined,
   retry: AnswerEntry | null,
 ): boolean {
@@ -1166,9 +1116,65 @@ function matchesAnswerOperation(
       );
 }
 
+// POST 只送本次問題或重試識別；同一個逾時涵蓋標頭及串流本文。
+async function requestAnswer(
+  body: object,
+  operation: AnswerOperation,
+  accept: (frame: Record<string, unknown>) => boolean,
+): Promise<ApiResult> {
+  // 單次逾時中止傳輸；整個操作仍可用原控制器安全讀回。
+  const timeout = AbortSignal.timeout(ANSWER_REQUEST_TIMEOUT_MS);
+  const signal = AbortSignal.any([operation.controller.signal, timeout]);
+
+  try {
+    // 原生 fetch 直接讀取資料流，保留原本的 JSON 拒絕狀態。
+    const response = await fetch("/api/answers", {
+      method: "POST",
+      body: JSON.stringify(body),
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: {
+        Accept: NDJSON,
+        "Content-Type": "application/json",
+        "X-CSRF-Protection": "1",
+      },
+      signal,
+    });
+    if (response.status !== 200) {
+      // 即使本文不是 JSON，仍保留 HTTP 狀態給認證及啟用檢查。
+      const data: unknown = await response.json().catch(
+        // 代理或斷線可能沒有錯誤本文；不將解析診斷交給畫面。
+        () => null,
+      );
+      return {
+        status: response.status,
+        data,
+        retryAfter: response.headers.get("Retry-After"),
+      };
+    }
+
+    // 拒絕協商錯誤或空串流，避免當成正常受理。
+    if (response.headers.get("Content-Type") !== NDJSON || !response.body) {
+      await response.body?.cancel();
+      return { status: null, data: null, retryAfter: null };
+    }
+    return await readAnswerStream(response.body, accept);
+  } catch {
+    // 逾時、取消或斷線都不能證明伺服器沒有受理。
+    return { status: null, data: null, retryAfter: null };
+  }
+}
+
+// 更新已知題目的當前狀態，不改動同一段對話的順序。
+function storeAnswerEntry(position: number, entry: AnswerEntry): void {
+  const entries = [...answerEntries.value];
+  entries[position] = entry;
+  answerEntries.value = entries;
+}
+
 // 送出首題、追問或同題重試；共用等待鎖但不佔用搜尋與登出的操作。
 async function submitAnswer(retry: AnswerEntry | null = null): Promise<void> {
-  // 以原本的登入物件與獨立操作識別目前等待者，防止交叉或重複送出。
+  // 由同一個登入物件和操作識別持有結果更新權；建單編輯期間不更換來源嘗試。
   const owner = identity.value;
   // prettier-ignore
   if (
@@ -1176,6 +1182,7 @@ async function submitAnswer(retry: AnswerEntry | null = null): Promise<void> {
     || !owner
     || answerOperation.value
     || isAnswerConversationBlocked.value
+    || ticketEditor.value
   ) {
     return;
   }
@@ -1190,6 +1197,7 @@ async function submitAnswer(retry: AnswerEntry | null = null): Promise<void> {
     && (
       position < 0
       || retry.output.status === "answered"
+      || retry.output.status === "unconfirmed"
       || retry.notice?.block === "retry"
     )
   ) {
@@ -1225,59 +1233,126 @@ async function submitAnswer(retry: AnswerEntry | null = null): Promise<void> {
     controller: new AbortController(),
     foregroundEpoch: null,
     retry,
+    admission: null,
   };
   answerOperation.value = operation;
   let focusId = `answer-result-${position}`;
 
   try {
-    // 只在問答讀取固定錯誤本文；模型等待使用較長期限，禁止自動重送。
-    const result = await requestApi(
-      "/api/answers",
-      operation,
-      {
-        method: "POST",
-        body,
-        ignoreResponseError: true,
-        headers: { "X-CSRF-Protection": "1" },
-      },
-      ANSWER_REQUEST_TIMEOUT_MS,
-    );
+    // 只在伺服器承諾受理且識別符合成員關係後，開放當前卡片的建單。
+    let result = await requestAnswer(body, operation, (frame) => {
+      // 已離開的登入或操作不得採用遲到的受理，也不能替換既有問題。
+      // prettier-ignore
+      if (
+        !isCurrentAnswer(operation, owner)
+        || !isAnswerIdentity(frame)
+        || !matchesAnswerOperation(frame, conversationId, retry)
+      ) {
+        return false;
+      }
+
+      // 複製核對後的識別；首次及追問增加一題，重試佔同一位置。
+      const { conversation_id, question_id, attempt_id } = frame;
+      const admission = { conversation_id, question_id, attempt_id };
+      operation.admission = admission;
+      if (!retry) {
+        admittedQuestionDraft = admission;
+      }
+      seenAnswerAttempts.add(attempt_id);
+      storeAnswerEntry(position, {
+        question,
+        output: {
+          ...admission,
+          status: "running",
+          answer: null,
+          citations: [],
+          search_results: [],
+        },
+      });
+      return true;
+    });
     if (!isCurrentAnswer(operation, owner)) {
       return;
     }
 
-    // 身分到期時清除工作台並聚焦登入，不保留私人問題或搜尋結果。
+    // 丟失或無效的終態只讀回一次，不重送 POST，也不採用不同嘗試的資料。
+    const admission = operation.admission;
+    let output = result.status === 200 ? readAnswerOutput(result.data) : null;
+    // prettier-ignore
+    if (
+      admission
+      && (result.status === null || result.status === 200)
+      && (!output || !sameAnswerAttempt(output, admission))
+    ) {
+      result = await requestApi(`/api/answers/${admission.attempt_id}`, operation, { method: "GET", ignoreResponseError: true });
+      if (!isCurrentAnswer(operation, owner)) {
+        return;
+      }
+      output = result.status === 200 ? readAnswerOutput(result.data) : null;
+    }
+
+    // 身分到期時清除整個私人工作台並回到登入。
     if (result.status === 401) {
       expireWorkbenchSession("登入工作階段已失效，請重新登入後提出問題。");
       return;
     }
 
-    // 回讀啟用狀態後仍要確認問答擁有權；ready 也不能證明這次問答的結果。
+    // 啟用讀回保護整個工作台；仍需核對本次問答沒有被工單結束。
     if (result.status === 503) {
       await recheckBusinessSetup();
       if (!isCurrentAnswer(operation, owner)) {
         return;
       }
     }
-    // 後端是輸入驗證的最後防線；格式拒絕後保留草稿供修正。
-    if (result.status === 422 && !retry) {
+
+    // 後端格式拒絕後保留草稿供修正。
+    // prettier-ignore
+    if (
+      !admission
+      && result.status === 422
+      && !retry
+    ) {
       answerQuestionError.value = "問題未通過格式檢查，請修正後再提出。";
-      focus(answerQuestionInput);
+      if (ticketView.value === "workbench" && !ticketEditor.value) {
+        focus(answerQuestionInput);
+      }
       return;
     }
 
-    // 只採用可驗證的終態；無效回應不增加題數、不替換舊結果。
-    const output = result.status === 200 ? readAnswerOutput(result.data) : null;
-    const entries = [...answerEntries.value];
-    if (output && matchesAnswerOperation(output, conversationId, retry)) {
-      seenAnswerAttempts.add(output.attempt_id);
-      entries[position] = { question, output };
-      answerEntries.value = entries;
+    // 終態只能更新已受理的同一組識別，不能建立或換掉另一題。
+    // prettier-ignore
+    if (
+      admission
+      && output
+      && sameAnswerAttempt(output, admission)
+    ) {
+      storeAnswerEntry(position, { question, output });
       if (!retry) {
+        admittedQuestionDraft = null;
         answerQuestion.value = "";
       }
+    } else if (admission) {
+      // 受理後的 404 也可能是建單已提交、回應尚未到達。保留可建單的原識別，
+      // 讓建單成功補回停等狀態，不把可繼續的對話誤判為不存在。
+      const entry = answerEntries.value[position];
+      if (entry?.output.status === "running") {
+        storeAnswerEntry(position, {
+          ...entry,
+          output: { ...entry.output, status: "unconfirmed" },
+        });
+      }
+
+      // 只有明確失效契約才限制已確認的對話；其他失敗保留題卡供復原。
+      const detail = asRecord(result.data)?.detail;
+      if (
+        (result.status === 410 && detail === "問答暫存已到期。") ||
+        (result.status === 503 && detail === ANSWER_KEY_CHANGED)
+      ) {
+        answerNotice.value = readAnswerFailure(result, retry !== null);
+        focusId = "answer-notice-title";
+      }
     } else {
-      // 局部重試錯誤跟著原卡保留；整段對話的限制則放在提問區。
+      // 尚未受理的局部重試錯誤跟著原卡；整段對話限制放在提問區。
       const notice = readAnswerFailure(result, retry !== null);
       // prettier-ignore
       if (
@@ -1285,8 +1360,7 @@ async function submitAnswer(retry: AnswerEntry | null = null): Promise<void> {
         && notice.block !== "conversation"
         && notice.block !== "new-question"
       ) {
-        entries[position] = { ...retry, notice };
-        answerEntries.value = entries;
+        storeAnswerEntry(position, { ...retry, notice });
         focusId = `answer-retry-notice-${position}`;
       } else {
         answerNotice.value = notice;
@@ -1294,13 +1368,13 @@ async function submitAnswer(retry: AnswerEntry | null = null): Promise<void> {
       }
     }
   } finally {
-    // 只釋放本次等待；清除頁面後開始的新操作不受舊回應影響。
+    // 只釋放本次等待；清除頁面或建單後開始的新操作不受舊結果影響。
     if (answerOperation.value === operation) {
       answerOperation.value = null;
     }
   }
 
-  // 待結果掛載後才聚焦；切換身分或清除對話後不聚焦舊位置。
+  // 只在使用者仍留在問答操作區時移動焦點，不從工單或搜尋搶回焦點。
   const entries = answerEntries.value;
   await nextTick();
   // prettier-ignore
@@ -1309,9 +1383,414 @@ async function submitAnswer(retry: AnswerEntry | null = null): Promise<void> {
     && isServiceReady.value
     && answerEntries.value === entries
     && !answerOperation.value
+    && !ticketEditor.value
+    && ticketView.value === "workbench"
+    && (document.activeElement === document.body || answerWorkspace.value?.contains(document.activeElement))
   ) {
     document.getElementById(focusId)?.focus();
   }
+}
+
+// 清除草稿與回饋只用於明確關閉、確認建單或離開登入。
+function resetTicketEditor(): void {
+  ticketEditor.value = null;
+  ticketDescription.value = "";
+  unconfirmedTicketDescription = null;
+  ticketFormError.value = "";
+  ticketDescriptionInvalid.value = false;
+}
+
+// 清除前一工作階段的表單、清單和快照，撤銷所有遲到回應的更新權。
+function clearTickets(): void {
+  // 先撤銷目前操作，再取消讀寫傳輸；取消 POST 不能推定未提交。
+  const write = ticketWrite.value;
+  const read = ticketRead.value;
+  ticketWrite.value = null;
+  ticketRead.value = null;
+  write?.controller.abort();
+  read?.controller.abort();
+
+  // 同一頁返回也不展示舊帳號的資料或草稿。
+  resetTicketEditor();
+  ticketView.value = "workbench";
+  ticketPage.value = null;
+  ticketDetail.value = null;
+  ticketDetailId.value = null;
+  ticketOffset.value = 0;
+  ticketReadError.value = "";
+  ticketCreated.value = false;
+}
+
+// 建單表單鎖定畫面已確認的題目和嘗試；草稿與原題分開保存。
+function openTicketEditor(entry: AnswerEntry): void {
+  // 舊嘗試正在換成新嘗試時，等收到本次受理再允許建單。
+  // prettier-ignore
+  if (
+    !identity.value
+    || !isServiceReady.value
+    || ticketEditor.value
+    || !answerEntries.value.includes(entry)
+    || answerOperation.value?.retry === entry
+  ) {
+    return;
+  }
+
+  // 只綁定不透明識別；不把畫面的回答或來源放進寫入本文。
+  const { conversation_id, question_id, attempt_id } = entry.output;
+  ticketEditor.value = {
+    question: entry.question,
+    source: { conversation_id, question_id, attempt_id },
+  };
+  ticketDescription.value = entry.question;
+  focus(ticketDescriptionInput);
+}
+
+// 明確取消後回到對應題目的原控制項；寫入未完成時不關閉草稿。
+async function closeTicketEditor(): Promise<void> {
+  const editor = ticketEditor.value;
+  const owner = identity.value;
+  if (!editor || ticketWrite.value) {
+    return;
+  }
+  resetTicketEditor();
+
+  // 等待按鈕解除停用，並避免在工作台已切換後聚焦。
+  await nextTick();
+  if (identity.value === owner && ticketView.value === "workbench") {
+    document
+      .getElementById(`create-ticket-${editor.source.question_id}`)
+      ?.focus();
+  }
+}
+
+// 草稿仍可編輯；更正文字後只解除本地欄位錯誤，未知寫入的回饋仍應保留。
+function handleTicketDescriptionInput(): void {
+  if (ticketDescriptionInvalid.value) {
+    ticketDescriptionInvalid.value = false;
+    ticketFormError.value = "";
+  }
+}
+
+// 與後端共用純文字規則；使用碼位而非 textarea 的 UTF-16 上限。
+function validateTicketDescription(description: string): string {
+  // 拒絕超限文字，不能自動截斷有效的代理字元對或草稿。
+  if (
+    description.length > MAX_TICKET_DESCRIPTION_CODE_POINTS * 2 ||
+    Array.from(description).length > MAX_TICKET_DESCRIPTION_CODE_POINTS
+  ) {
+    return "問題描述不可超過 4,000 個 Unicode 字元。";
+  }
+
+  // 拒絕控制字元及未配對代理字元，保留允許的空白與換行。
+  if (INVALID_PLAIN_TEXT_CHARACTER.test(description)) {
+    return "問題描述包含無法使用的字元，請修正後再送出。";
+  }
+  return BLANK_PLAIN_TEXT.test(description) ? "請輸入問題描述。" : "";
+}
+
+// 讀取和寫入各持有自己的更新權，回讀後仍要核對原登入身分。
+function isCurrentTicket(
+  operation: Operation,
+  owner: IdentityDto,
+  current: Operation | null,
+): boolean {
+  // prettier-ignore
+  return (
+    current === operation
+    && !operation.controller.signal.aborted
+    && isServiceReady.value
+    && identity.value === owner
+  );
+}
+
+// 固定回覆說明可操作的復原方式，不呈現任意服務端錯誤內容。
+function ticketFailureMessage(status: number | null, isWrite: boolean): string {
+  switch (status) {
+    case 403:
+      return "工單要求未通過來源驗證，請重新載入本機頁面後再試。";
+    case 404:
+      return isWrite ? "找不到指定的問答或工單。" : "找不到這張工單。";
+    case 409:
+      return "這次問答已更新，請返回問答卡使用目前的嘗試。";
+    case 410:
+      return "問答暫存已到期，無法從這次問答建立新工單。";
+    case 422:
+      return "問題描述未通過格式檢查，請修正後再送出。";
+    default:
+      return isWrite
+        ? TICKET_WRITE_UNCONFIRMED
+        : "目前無法讀取工單，請稍後手動重試。";
+  }
+}
+
+// 只有同一題且同一次嘗試的快照能補上問答卡，較舊的工單不能結束新的等待。
+function reconcileTicketSnapshot(ticket: TicketDetail): void {
+  // 從目前卡片取對話識別；工單本身不保存或回傳對話識別。
+  const position = answerEntries.value.findIndex(
+    // 重送較新的嘗試可能回傳更早的快照，必須同時比對兩個識別。
+    (entry) =>
+      entry.output.question_id === ticket.question_id &&
+      entry.output.attempt_id === ticket.attempt_id,
+  );
+  const entry = answerEntries.value[position];
+  if (!entry) {
+    return;
+  }
+
+  // 已完成終態維持原畫面；執行中或不確定的狀態可由同次快照補上。
+  if (
+    entry.output.status !== "unconfirmed" &&
+    entry.output.status !== "running"
+  ) {
+    return;
+  }
+  storeAnswerEntry(position, {
+    question: entry.question,
+    output: {
+      ...entry.output,
+      status: ticket.answer_status,
+      answer: ticket.answer,
+      citations: ticket.citations,
+      search_results: ticket.search_results,
+    },
+  });
+
+  // 只清除尚未另行編輯的同次草稿。
+  if (
+    admittedQuestionDraft &&
+    sameAnswerAttempt(admittedQuestionDraft, entry.output)
+  ) {
+    admittedQuestionDraft = null;
+    answerQuestion.value = "";
+  }
+
+  // 建單交易已保存停等；釋放操作後才取消傳輸，遲到終態不能覆寫快照。
+  const operation = answerOperation.value;
+  // prettier-ignore
+  if (
+    ticket.answer_status === "stopped"
+    && operation?.admission
+    && sameAnswerAttempt(operation.admission, entry.output)
+  ) {
+    answerOperation.value = null;
+    operation.controller.abort();
+  }
+}
+
+// 明確送出一次建單；未知結果保留草稿，只接受手動重送或列表讀回。
+async function submitTicket(): Promise<void> {
+  // 寫入只屬於原編輯器與登入；連按、關閉及前景切換不能發起第二次 POST。
+  const owner = identity.value;
+  const editor = ticketEditor.value;
+  // prettier-ignore
+  if (
+    !owner
+    || !editor
+    || !isServiceReady.value
+    || ticketWrite.value
+  ) {
+    return;
+  }
+
+  // 使用者修正或重試前保留實際文字，不去除原本的空白。
+  const description = ticketDescription.value;
+  ticketFormError.value = validateTicketDescription(description);
+  ticketDescriptionInvalid.value = !!ticketFormError.value;
+  if (ticketDescriptionInvalid.value) {
+    focus(ticketDescriptionInput);
+    return;
+  }
+
+  // 發送的本文只有後端約定的三個欄位。
+  const operation: Operation = {
+    controller: new AbortController(),
+    foregroundEpoch: null,
+  };
+  ticketWrite.value = operation;
+  try {
+    const result = await requestApi("/api/tickets", operation, {
+      method: "POST",
+      body: {
+        question_id: editor.source.question_id,
+        attempt_id: editor.source.attempt_id,
+        description,
+      },
+      headers: { "X-CSRF-Protection": "1" },
+    });
+    if (!isCurrentTicket(operation, owner, ticketWrite.value)) {
+      return;
+    }
+
+    // 未登入立即隱藏所有私人資料；503 只讀回服務啟用狀態。
+    if (result.status === 401) {
+      expireWorkbenchSession("登入工作階段已失效，請重新登入後查看工單。");
+      return;
+    }
+    if (result.status === 503) {
+      await recheckBusinessSetup();
+      if (!isCurrentTicket(operation, owner, ticketWrite.value)) {
+        return;
+      }
+    }
+
+    // 原題識別必須相符；同題不同嘗試的重送可能合法讀回既有工單。
+    const saved =
+      result.status === 200
+        ? readTicketDetail(result.data, owner.username)
+        : null;
+    if (saved && saved.question_id === editor.source.question_id) {
+      reconcileTicketSnapshot(saved);
+      resetTicketEditor();
+      ticketDetailId.value = saved.id;
+      ticketDetail.value = saved;
+      ticketOffset.value = 0;
+      ticketCreated.value = true;
+      ticketView.value = "detail";
+      focus(ticketHeading);
+      return;
+    }
+
+    // 寫入未獲確認或被拒絕時保留草稿，讓使用者能手動復原。
+    ticketFormError.value = ticketFailureMessage(result.status, true);
+    if (ticketFormError.value === TICKET_WRITE_UNCONFIRMED) {
+      // 只記錄實際送出且結果未知的描述；欄位或 HTTP 拒絕不能建立復原標記。
+      unconfirmedTicketDescription = description;
+    }
+    ticketDescriptionInvalid.value = result.status === 422;
+    focus(
+      ticketDescriptionInvalid.value
+        ? ticketDescriptionInput
+        : ticketFormFeedback,
+    );
+  } finally {
+    // 較舊的寫入不能清除新工作階段的提交狀態。
+    if (ticketWrite.value === operation) {
+      ticketWrite.value = null;
+    }
+  }
+}
+
+// 清單或詳情使用獨立的讀取擁有權，切換時取消舊請求及清空舊資料。
+async function loadTickets(
+  id: string | null,
+  offset = ticketOffset.value,
+): Promise<void> {
+  // 保留未提交或未知結果的草稿；只有正在寫入時暫停導航。
+  const owner = identity.value;
+  // prettier-ignore
+  if (
+    !owner
+    || !isServiceReady.value
+    || ticketWrite.value
+  ) {
+    return;
+  }
+
+  // 清除前一次結果，防止切換詳情或分頁時顯示舊資料。
+  ticketRead.value?.controller.abort();
+  const operation: Operation = {
+    controller: new AbortController(),
+    foregroundEpoch: null,
+  };
+  ticketRead.value = operation;
+  ticketOffset.value = offset;
+  ticketDetailId.value = id;
+  ticketDetail.value = null;
+  ticketPage.value = null;
+  ticketReadError.value = "";
+  ticketCreated.value = false;
+  ticketView.value = id ? "detail" : "list";
+  focus(ticketHeading);
+
+  try {
+    // 列表只讀指定的一頁；明細依已驗證的工單識別定位。
+    const path = id
+      ? `/api/tickets/${id}`
+      : `/api/tickets?limit=${TICKET_PAGE_SIZE}&offset=${offset}`;
+    const result = await requestApi(path, operation, { method: "GET" });
+    if (!isCurrentTicket(operation, owner, ticketRead.value)) {
+      return;
+    }
+
+    // 失去登入或啟用後回到既有安全流程，不顯示任何舊資料。
+    if (result.status === 401) {
+      expireWorkbenchSession("登入工作階段已失效，請重新登入後查看工單。");
+      return;
+    }
+    if (result.status === 503) {
+      await recheckBusinessSetup();
+      if (!isCurrentTicket(operation, owner, ticketRead.value)) {
+        return;
+      }
+    }
+
+    // 僅採用合法分頁，或符合本次識別與登入者的快照。
+    if (result.status === 200) {
+      if (id) {
+        const detail = readTicketDetail(result.data, owner.username);
+        if (detail?.id === id) {
+          // 只有同題、同嘗試的快照能確認先前結果未知的送出。
+          reconcileTicketSnapshot(detail);
+          const editor = ticketEditor.value;
+          const submittedDescription = unconfirmedTicketDescription;
+          // prettier-ignore
+          if (
+            submittedDescription !== null
+            && editor?.source.question_id === detail.question_id
+            && editor.source.attempt_id === detail.attempt_id
+          ) {
+            unconfirmedTicketDescription = null;
+
+            // 只收起已保存且未再編輯的草稿，保留後續的編輯及拒絕回饋。
+            if (ticketFormError.value === TICKET_WRITE_UNCONFIRMED) {
+              if (
+                ticketDescription.value === submittedDescription &&
+                detail.description === submittedDescription
+              ) {
+                resetTicketEditor();
+              } else {
+                ticketFormError.value = "";
+              }
+            }
+          }
+          ticketDetail.value = detail;
+          return;
+        }
+      } else {
+        const page = readTicketPage(result.data, TICKET_PAGE_SIZE);
+        if (page) {
+          ticketPage.value = page;
+          return;
+        }
+      }
+    }
+
+    // 原導航仍有效時才顯示讀取失敗與手動重試。
+    ticketReadError.value = ticketFailureMessage(result.status, false);
+    focus(ticketReadFeedback);
+  } finally {
+    // 只釋放這次讀取；返回工作台或換頁不等待舊讀取完成。
+    if (ticketRead.value === operation) {
+      ticketRead.value = null;
+    }
+  }
+}
+
+// 回到問答及搜尋，保留本頁對話與尚待確認的建單描述。
+function showWorkbench(): void {
+  if (ticketWrite.value || ticketView.value === "workbench") {
+    return;
+  }
+  // 先釋放讀取擁有權，避免遲到錯誤把焦點帶回隱藏的工單區。
+  const operation = ticketRead.value;
+  ticketRead.value = null;
+  operation?.controller.abort();
+  ticketPage.value = null;
+  ticketDetail.value = null;
+  ticketDetailId.value = null;
+  ticketReadError.value = "";
+  ticketView.value = "workbench";
+  focus(ticketEditor.value ? ticketDescriptionInput : workbenchHeading);
 }
 
 // 登出失敗或逾時時只讀回 session，避免盲目重送非冪等異動。
@@ -1391,6 +1870,7 @@ watch(
     ) {
       cancelKnowledgeSearch();
       clearAnswer();
+      clearTickets();
       businessSetupReadback?.controller.abort();
     }
   },
@@ -1405,9 +1885,9 @@ onMounted(() => {
   window.addEventListener("blur", leaveForeground);
   window.addEventListener("focus", checkSetupOnForeground);
   document.addEventListener("visibilitychange", handleVisibilityChange);
-  // 瀏覽器可能快取離開的頁面；返回只檢查啟用，不續聊。
-  window.addEventListener("pagehide", clearPageBusinessState);
-  window.addEventListener("pageshow", checkSetupOnForeground);
+  // 瀏覽器可能快取離開的頁面；返回需確認啟用及身分，但不續聊。
+  window.addEventListener("pagehide", handlePageHide);
+  window.addEventListener("pageshow", handlePageShow);
 });
 
 // 離開頁面時取消目前操作，使遲到回應不能更新卸載後的畫面。
@@ -1416,8 +1896,8 @@ onBeforeUnmount(() => {
   window.removeEventListener("blur", leaveForeground);
   window.removeEventListener("focus", checkSetupOnForeground);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
-  window.removeEventListener("pagehide", clearPageBusinessState);
-  window.removeEventListener("pageshow", checkSetupOnForeground);
+  window.removeEventListener("pagehide", handlePageHide);
+  window.removeEventListener("pageshow", handlePageShow);
 
   // 工作台卸載時取消業務操作與回讀，避免遲到結果留在新畫面。
   clearPageBusinessState();
@@ -1625,10 +2105,24 @@ onBeforeUnmount(() => {
 
         <nav class="workbench-nav" aria-label="工作台導覽">
           <p class="rail-label">工作區</p>
-          <span class="nav-current" aria-current="page">
-            <span class="nav-indicator" aria-hidden="true"></span>
+          <button
+            type="button"
+            class="workbench-nav-action"
+            :aria-current="ticketView === 'workbench' ? 'page' : undefined"
+            :disabled="ticketWrite !== null"
+            @click="showWorkbench"
+          >
             工作台
-          </span>
+          </button>
+          <button
+            type="button"
+            class="workbench-nav-action"
+            :aria-current="ticketView !== 'workbench' ? 'page' : undefined"
+            :disabled="ticketWrite !== null"
+            @click="loadTickets(null, 0)"
+          >
+            我的工單
+          </button>
         </nav>
 
         <div class="rail-account">
@@ -1659,7 +2153,12 @@ onBeforeUnmount(() => {
           {{ authMessage }}
         </p>
 
-        <section class="answer-workspace" aria-labelledby="answer-title">
+        <section
+          v-show="ticketView === 'workbench'"
+          ref="answerWorkspace"
+          class="answer-workspace"
+          aria-labelledby="answer-title"
+        >
           <p class="eyebrow">AI 問答</p>
           <h2 id="answer-title">提出問題</h2>
           <p class="knowledge-search-intro">
@@ -1695,7 +2194,15 @@ onBeforeUnmount(() => {
             >
               <h3>第 {{ position + 1 }} 題</h3>
               <p class="answer-text">{{ entry.question }}</p>
-              <template v-if="entry.output.status === 'answered'">
+              <p v-if="entry.output.status === 'running'" role="status">
+                {{
+                  answerOperation?.retry?.output.question_id ===
+                  entry.output.question_id
+                    ? "正在重試這一題，請稍候。"
+                    : "正在查詢知識文件並處理這一題，請稍候。"
+                }}
+              </p>
+              <template v-else-if="entry.output.status === 'answered'">
                 <h4 :id="`answer-result-${position}`" tabindex="-1">回答</h4>
                 <p class="knowledge-search-help">
                   模型 <code>{{ SETUP_MODEL }}</code>
@@ -1708,12 +2215,22 @@ onBeforeUnmount(() => {
                 <div class="knowledge-search-feedback">
                   <h4 :id="`answer-result-${position}`" tabindex="-1">
                     {{
-                      answerOperation?.retry === entry
-                        ? "上次問答未完成"
-                        : "問答未完成"
+                      entry.output.status === "stopped"
+                        ? "回答未完成"
+                        : answerOperation?.retry === entry
+                          ? "上次問答未完成"
+                          : "問答未完成"
                     }}
                   </h4>
-                  <p>{{ answerStatusMessages[entry.output.status] }}</p>
+                  <p v-if="entry.output.status === 'unconfirmed'">
+                    伺服器已受理，但目前無法確認回答結果。可從這一題建立工單，取得已保存的證據。
+                  </p>
+                  <p v-else-if="entry.output.status === 'stopped'">
+                    這次問答已停止等待，可查看建單時保存的搜尋結果。
+                  </p>
+                  <p v-else>
+                    {{ answerStatusMessages[entry.output.status] }}
+                  </p>
                   <p
                     v-if="entry.notice && answerOperation?.retry !== entry"
                     :id="`answer-retry-notice-${position}`"
@@ -1723,31 +2240,126 @@ onBeforeUnmount(() => {
                     {{ entry.notice.message }}
                   </p>
                 </div>
-                <h5>本次已取得的搜尋結果</h5>
-                <KnowledgeResultList
-                  v-if="entry.output.search_results.length"
-                  :results="entry.output.search_results"
-                />
-                <p v-else>本次問答沒有取得符合的知識片段。</p>
+                <template v-if="entry.output.status !== 'unconfirmed'">
+                  <h5>本次已取得的搜尋結果</h5>
+                  <KnowledgeResultList
+                    v-if="entry.output.search_results.length"
+                    :results="entry.output.search_results"
+                  />
+                  <p v-else>本次問答沒有取得符合的知識片段。</p>
+                </template>
                 <p v-if="answerOperation?.retry === entry" role="status">
                   正在重試這一題，請稍候。
                 </p>
                 <button
                   v-if="
                     !isAnswerConversationBlocked &&
-                    entry.notice?.block !== 'retry'
+                    entry.notice?.block !== 'retry' &&
+                    entry.output.status !== 'unconfirmed'
                   "
                   type="button"
                   class="answer-secondary-action"
                   :aria-label="`重試這一題（第 ${position + 1} 題）`"
-                  :disabled="answerOperation !== null"
+                  :disabled="answerOperation !== null || ticketEditor !== null"
                   @click="submitAnswer(entry)"
                 >
                   重試這一題
                 </button>
               </template>
+              <button
+                :id="`create-ticket-${entry.output.question_id}`"
+                type="button"
+                class="answer-secondary-action"
+                :aria-label="`建立工單（第 ${position + 1} 題）`"
+                :disabled="
+                  ticketEditor !== null || answerOperation?.retry === entry
+                "
+                @click="openTicketEditor(entry)"
+              >
+                建立工單
+              </button>
             </li>
           </ol>
+
+          <section
+            v-if="ticketEditor"
+            class="knowledge-search-state"
+            aria-labelledby="ticket-editor-title"
+          >
+            <h3 id="ticket-editor-title">建立工單</h3>
+            <p class="knowledge-search-help">
+              原始問題會另存為證據，您可以補充問題背景。
+            </p>
+            <p class="answer-text">
+              <strong>原始問題：</strong>{{ ticketEditor.question }}
+            </p>
+            <form
+              class="login-form answer-form"
+              :aria-busy="ticketWrite !== null"
+              novalidate
+              @submit.prevent="submitTicket"
+            >
+              <div class="field-group">
+                <label for="ticket-description">問題描述</label>
+                <textarea
+                  id="ticket-description"
+                  ref="ticketDescriptionInput"
+                  v-model="ticketDescription"
+                  name="description"
+                  rows="5"
+                  required
+                  autocomplete="off"
+                  :readonly="ticketWrite !== null"
+                  :aria-invalid="ticketDescriptionInvalid ? 'true' : undefined"
+                  :aria-describedby="
+                    ticketFormError
+                      ? 'ticket-description-help ticket-form-error'
+                      : 'ticket-description-help'
+                  "
+                  @input="handleTicketDescriptionInput"
+                ></textarea>
+                <p id="ticket-description-help" class="knowledge-search-help">
+                  最多 4,000 個 Unicode 字元。
+                </p>
+                <p
+                  v-if="ticketFormError"
+                  id="ticket-form-error"
+                  ref="ticketFormFeedback"
+                  class="form-feedback"
+                  role="alert"
+                  tabindex="-1"
+                >
+                  {{ ticketFormError }}
+                </p>
+              </div>
+              <button
+                type="submit"
+                class="primary-action"
+                :disabled="ticketWrite !== null"
+              >
+                {{ ticketWrite ? "建立中…" : "送出工單" }}
+              </button>
+              <div class="ticket-actions">
+                <button
+                  type="button"
+                  class="answer-secondary-action"
+                  :disabled="ticketWrite !== null"
+                  @click="closeTicketEditor"
+                >
+                  取消建單
+                </button>
+                <button
+                  v-if="ticketFormError && !ticketDescriptionInvalid"
+                  type="button"
+                  class="answer-secondary-action"
+                  :disabled="ticketWrite !== null"
+                  @click="loadTickets(null, 0)"
+                >
+                  查看我的工單
+                </button>
+              </div>
+            </form>
+          </section>
 
           <form
             class="login-form answer-form"
@@ -1775,7 +2387,7 @@ onBeforeUnmount(() => {
                     ? 'answer-question-help answer-question-error'
                     : 'answer-question-help'
                 "
-                @input="answerQuestionError = ''"
+                @input="handleAnswerQuestionInput"
               ></textarea>
               <p id="answer-question-help" class="knowledge-search-help">
                 最多 2,000 個 Unicode 字元。
@@ -1794,6 +2406,7 @@ onBeforeUnmount(() => {
               class="primary-action"
               :disabled="
                 answerOperation !== null ||
+                ticketEditor !== null ||
                 isAnswerAtLimit ||
                 isAnswerConversationBlocked
               "
@@ -1804,7 +2417,7 @@ onBeforeUnmount(() => {
               v-if="answerEntries.length || isAnswerConversationBlocked"
               type="button"
               class="answer-secondary-action"
-              :disabled="answerOperation !== null"
+              :disabled="answerOperation !== null || ticketEditor !== null"
               @click="startNewConversation"
             >
               開始新的對話
@@ -1812,16 +2425,22 @@ onBeforeUnmount(() => {
           </form>
 
           <p
-            v-if="answerOperation && !answerOperation.retry"
+            v-if="
+              answerOperation &&
+              !answerOperation.retry &&
+              !answerOperation.admission
+            "
             id="answer-pending-status"
             class="knowledge-search-state"
             role="status"
           >
-            正在查詢知識文件並處理第 {{ answerEntries.length + 1 }} 題，請稍候。
+            正在查詢知識文件並處理第
+            {{ answerEntries.length + 1 }} 題，請稍候。
           </p>
         </section>
 
         <section
+          v-show="ticketView === 'workbench'"
           class="knowledge-search"
           aria-labelledby="knowledge-search-title"
         >
@@ -1920,6 +2539,125 @@ onBeforeUnmount(() => {
               <KnowledgeResultList :results="knowledgeResults" />
             </template>
           </section>
+        </section>
+
+        <section
+          v-if="ticketView !== 'workbench'"
+          class="ticket-workspace"
+          aria-labelledby="ticket-title"
+        >
+          <p class="eyebrow">工單</p>
+          <h2 id="ticket-title" ref="ticketHeading" tabindex="-1">
+            {{ ticketView === "list" ? "我的工單" : "工單詳情" }}
+          </h2>
+          <button
+            v-if="ticketView === 'detail'"
+            type="button"
+            class="answer-secondary-action"
+            @click="loadTickets(null)"
+          >
+            返回我的工單
+          </button>
+
+          <p v-if="ticketRead" class="knowledge-search-state" role="status">
+            正在讀取工單，請稍候。
+          </p>
+          <div v-else-if="ticketReadError" class="knowledge-search-feedback">
+            <p ref="ticketReadFeedback" role="alert" tabindex="-1">
+              {{ ticketReadError }}
+            </p>
+            <button
+              type="button"
+              class="answer-secondary-action"
+              @click="loadTickets(ticketDetailId)"
+            >
+              重試讀取
+            </button>
+          </div>
+
+          <template v-else-if="ticketPage">
+            <p
+              v-if="!ticketPage.tickets.length"
+              class="knowledge-search-state"
+              role="status"
+            >
+              {{
+                ticketOffset
+                  ? "這一頁沒有工單。"
+                  : "目前沒有工單。您可以從問答卡建立工單。"
+              }}
+            </p>
+            <ul v-else class="ticket-list" aria-label="我的工單列表">
+              <li
+                v-for="ticket in ticketPage.tickets"
+                :key="ticket.id"
+                class="knowledge-search-state"
+              >
+                <p class="ticket-summary-text">{{ ticket.description }}</p>
+                <dl class="knowledge-result-details">
+                  <div>
+                    <dt>工單編號</dt>
+                    <dd>
+                      <code>{{ ticket.id }}</code>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>工單狀態</dt>
+                    <dd>開啟</dd>
+                  </div>
+                  <div>
+                    <dt>建立時間</dt>
+                    <dd>
+                      <time :datetime="ticket.created_at">{{
+                        ticketTime(ticket.created_at)
+                      }}</time>
+                    </dd>
+                  </div>
+                </dl>
+                <button
+                  type="button"
+                  class="answer-secondary-action"
+                  :aria-label="`查看工單 ${ticket.id}`"
+                  @click="loadTickets(ticket.id)"
+                >
+                  查看工單
+                </button>
+              </li>
+            </ul>
+            <nav
+              v-if="ticketOffset > 0 || ticketPage.has_more"
+              class="ticket-actions"
+              aria-label="工單分頁"
+            >
+              <button
+                v-if="ticketOffset > 0"
+                type="button"
+                class="answer-secondary-action"
+                @click="loadTickets(null, ticketOffset - TICKET_PAGE_SIZE)"
+              >
+                上一頁
+              </button>
+              <button
+                v-if="ticketPage.has_more"
+                type="button"
+                class="answer-secondary-action"
+                @click="loadTickets(null, ticketOffset + TICKET_PAGE_SIZE)"
+              >
+                下一頁
+              </button>
+            </nav>
+          </template>
+
+          <template v-else-if="ticketDetail">
+            <p
+              v-if="ticketCreated"
+              class="knowledge-search-state"
+              role="status"
+            >
+              已儲存工單；同一問題再次送出會保留原工單和原描述。
+            </p>
+            <TicketSnapshot :ticket="ticketDetail" />
+          </template>
         </section>
 
         <p class="workbench-note">

@@ -36,7 +36,7 @@ def settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
         conn.execute(
             "TRUNCATE activation, model_requests, daily_model_quota, "
             "login_sessions, demo_accounts, login_rate_limits, knowledge_documents, "
-            "conversations, questions, answer_attempts"
+            "conversations, questions, answer_attempts, tickets, ticket_attempt_replays"
         )
         conn.execute("INSERT INTO activation DEFAULT VALUES")
     write_private(

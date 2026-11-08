@@ -110,3 +110,27 @@ ALTER TABLE answer_attempts
     ADD COLUMN IF NOT EXISTS deadline_at timestamptz;
 CREATE UNIQUE INDEX IF NOT EXISTS questions_by_position ON questions (conversation_id, position);
 CREATE UNIQUE INDEX IF NOT EXISTS attempts_by_number ON answer_attempts (question_id, attempt_number);
+
+-- 工單快照永久保留，不參照會清理的問答或可更新的知識來源。
+CREATE TABLE IF NOT EXISTS tickets (
+    id uuid PRIMARY KEY,
+    question_id uuid NOT NULL UNIQUE,
+    attempt_id uuid NOT NULL,
+    description text NOT NULL,
+    question text NOT NULL,
+    answer_status text NOT NULL,
+    answer text,
+    citations jsonb NOT NULL,
+    search_results jsonb NOT NULL,
+    created_by text NOT NULL REFERENCES demo_accounts (username),
+    created_at timestamptz NOT NULL,
+    status text NOT NULL DEFAULT 'open'
+);
+CREATE INDEX IF NOT EXISTS tickets_by_owner ON tickets (created_by, created_at DESC, id DESC);
+
+-- 已核對的重送只保留識別，與工單同壽命，且不參照暫存問答。
+CREATE TABLE IF NOT EXISTS ticket_attempt_replays (
+    ticket_id uuid NOT NULL REFERENCES tickets (id) ON DELETE CASCADE,
+    attempt_id uuid NOT NULL,
+    PRIMARY KEY (ticket_id, attempt_id)
+);

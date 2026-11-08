@@ -1937,18 +1937,24 @@ def test_absolute_session_expiry_during_final_answer_sql(
         )
         assert denied.status_code == 401 and "私人回答" not in denied.text
 
-    # 讀取拒絕不抹除原本已提交的回答，寫入拒絕則不得保存私人內容或模型前文。
+    # 拒絕不抹除已提交的工具證據，也不會寫入新的私人回答、引用或模型前文。
     assert len(provider_script.requests) == 2
     with answer_ready.connect() as conn:
         assert conn.execute("SELECT count(*) FROM login_sessions").fetchone() == (0,)
         assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (3,)
         row = conn.execute(
-            "SELECT status, answer, search_results, model_steps IS NULL FROM answer_attempts"
+            "SELECT status, answer, search_results, citations, model_steps IS NULL FROM answer_attempts"
         ).fetchone()
         if readback:
-            assert row == ("answered", "私人回答。", ORIGINAL_RESULTS["results"], False)
+            assert row == (
+                "answered",
+                "私人回答。",
+                ORIGINAL_RESULTS["results"],
+                [ORIGINAL_RESULTS["results"][1]],
+                False,
+            )
         else:
-            assert row == ("stopped", None, [], True)
+            assert row == ("stopped", None, ORIGINAL_RESULTS["results"], [], True)
 
 
 @pytest.mark.parametrize("retry", [False, True])

@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 import psycopg
 from google.genai._gaos.types.interactions import StepParam
 from psycopg.types.json import Jsonb
-from pydantic import BaseModel, BeforeValidator, Field
+from pydantic import BaseModel, BeforeValidator, Field, TypeAdapter
 
 from backend import knowledge, sessions
 from backend.activation import activation_binding
@@ -42,6 +42,9 @@ AnswerStatus = Literal[
     "timed_out",
     "unavailable",
 ]
+SEARCH_RESULTS: TypeAdapter[list[knowledge.SearchResult]] = TypeAdapter(
+    list[knowledge.SearchResult]
+)
 
 
 # 原始 JSON 的識別必須是標準 UUID 字串，不能把空值視為新對話。
@@ -243,16 +246,22 @@ def start_attempt(
                 was_busy = busy_at_arrival(conn, digest, form.conversation_id)
         bound_transaction(conn)
         access = authorize(conn, settings, digest)
-        result: Attempt | AnswerDenied = (
-            access
-            if isinstance(access, AnswerDenied)
-            else admit_attempt(
-                conn, settings, digest, access, form, deadline_at, was_busy
-            )
-        )
-        if isinstance(result, Attempt):
-            return result
-    raise result
+        if isinstance(access, Access):
+            try:
+                # 最後一次寫入等待中若到期，回滾整次受理並保留外層的 Session 撤銷。
+                with conn.transaction():
+                    result = admit_attempt(
+                        conn, settings, digest, access, form, deadline_at, was_busy
+                    )
+                    if isinstance(result, AnswerDenied):
+                        raise result
+                    return result
+            except AnswerDenied as denied:
+                if denied.code != 401:
+                    raise
+                sessions.revoke_session(conn, digest)
+                access = denied
+    raise access
 
 
 # 只查 Cookie 摘要所屬的對話是否有未到期執行；此結果不作為授權或受理依據。
@@ -373,15 +382,26 @@ def admit_attempt(
             "INSERT INTO questions (id, conversation_id, question, position) VALUES (%s, %s, %s, %s)",
             (question_id, conversation_id, question, position),
         )
-    attempt = Attempt(conversation_id, question_id, uuid4(), current, question, history)
+    attempt_id = uuid4()
     conn.execute(
         """
         INSERT INTO answer_attempts (id, question_id, status, attempt_number, deadline_at)
         VALUES (%s, %s, 'running', %s, %s)
         """,
-        (attempt.id, question_id, number, deadline_at),
+        (attempt_id, question_id, number, deadline_at),
     )
-    return attempt
+
+    # 受理識別也屬於私人資料；SQL 寫完後、提交及交付之前再次確認授權與期限。
+    final_access = authorize(conn, settings, digest)
+    if isinstance(final_access, AnswerDenied):
+        return final_access
+    if final_access.key != current.key:
+        raise AnswerDenied(503, KEY_CHANGED)
+    if expiry is not None and sessions.utc_now() >= expiry:
+        raise AnswerDenied(410, EXPIRED)
+    return Attempt(
+        conversation_id, question_id, attempt_id, final_access, question, history
+    )
 
 
 # 用完整識別定位自有原題，再以資料庫嘗試序號拒絕過時或已成功的重試。
@@ -521,12 +541,53 @@ def search_attempt(
                 if isinstance(access, Access) and access.key == attempt.access.key:
                     check_attempt_window(window)
                     require_time(query_deadline)
-                    return results
+                    try:
+                        # 搜尋完成就保存快照；建單及終態寫入不依賴執行緒收到這次回傳值。
+                        with conn.transaction():
+                            if results:
+                                persist_search_results(conn, attempt.id, results)
+                            access = authorize(
+                                conn, settings, digest, deadline=query_deadline
+                            )
+                            if isinstance(access, AnswerDenied):
+                                raise access
+                            if access.key != attempt.access.key:
+                                raise AnswerDenied(503, KEY_CHANGED)
+                            check_attempt_window(window)
+                            require_time(query_deadline)
+                        return results
+                    except AnswerDenied as denied:
+                        if denied.code != 401:
+                            raise
+                        # 私人快照回滾，已到期的登入仍須撤銷。
+                        sessions.revoke_session(conn, digest)
+                        access = denied
 
     # 確定失效時不把已讀結果提供給模型或瀏覽器。
     if isinstance(access, AnswerDenied):
         raise access
     raise AnswerDenied(503, KEY_CHANGED)
+
+
+# 此執行只有一個搜尋寫入者，且對話共用鎖擋住停止和終態，依取得順序保留不重複的證據。
+def persist_search_results(
+    conn: psycopg.Connection[tuple[object, ...]],
+    attempt_id: UUID,
+    results: list[knowledge.SearchResult],
+) -> None:
+    row = conn.execute(
+        "SELECT search_results FROM answer_attempts WHERE id = %s", (attempt_id,)
+    ).fetchone()
+    if row is None:
+        raise AnswerDenied(404, NOT_FOUND)
+    evidence = SEARCH_RESULTS.validate_python(row[0])
+    for result in results:
+        if result not in evidence:
+            evidence.append(result)
+    conn.execute(
+        "UPDATE answer_attempts SET search_results = %s WHERE id = %s",
+        (Jsonb([source.model_dump() for source in evidence]), attempt_id),
+    )
 
 
 # 已確認拒絕只鎖原請求帳本，與送達狀態一起提交；未確認的請求維持原有結算。
@@ -602,7 +663,10 @@ def finish_attempt(
             # 先依對話再嘗試的順序持鎖，與到期清理一致；所有列到手後重新授權。
             if row is not None:
                 running = conn.execute(
-                    "SELECT deadline_at FROM answer_attempts WHERE id = %s AND status = 'running' FOR UPDATE",
+                    """
+                    SELECT deadline_at, search_results FROM answer_attempts
+                    WHERE id = %s AND status = 'running' FOR UPDATE
+                    """,
                     (attempt.id,),
                 ).fetchone()
                 access = authorize(conn, settings, digest)
@@ -620,6 +684,7 @@ def finish_attempt(
             if running is None or not isinstance(running[0], datetime):
                 raise AnswerDenied(404, NOT_FOUND)
             deadline_at = running[0]
+            response.search_results = SEARCH_RESULTS.validate_python(running[1])
 
             # HTTP 已斷線時不寫回答；等鎖超過總期限時只保存已取得的搜尋結果。
             if disconnected.is_set():
@@ -638,7 +703,7 @@ def finish_attempt(
                     updated = conn.execute(
                         """
                         UPDATE answer_attempts SET status = %s, answer = %s, citations = %s,
-                            search_results = %s, model_steps = %s
+                            model_steps = %s
                         WHERE id = %s AND status = 'running'
                         """,
                         (
@@ -646,12 +711,6 @@ def finish_attempt(
                             response.answer,
                             Jsonb(
                                 [source.model_dump() for source in response.citations]
-                            ),
-                            Jsonb(
-                                [
-                                    source.model_dump()
-                                    for source in response.search_results
-                                ]
                             ),
                             Jsonb(model_steps)
                             if response.status == "answered"
@@ -665,6 +724,13 @@ def finish_attempt(
                         "UPDATE conversations SET last_seen_at = GREATEST(last_seen_at, %s) WHERE id = %s",
                         (at, attempt.conversation_id),
                     )
+
+                    # 最後寫入也可能等待；確認登入和啟用仍有效，才允許提交私人結果。
+                    current = authorize(conn, settings, digest)
+                    if isinstance(current, AnswerDenied):
+                        raise current
+                    if current.key != attempt.access.key:
+                        raise AnswerDenied(503, KEY_CHANGED)
 
                     # 資料寫入也可能等待；提交前若超時，於同一交易撤掉未公布的回答與引用。
                     if response.status != "timed_out" and (
@@ -686,7 +752,7 @@ def finish_attempt(
                         raise AnswerDenied(410, EXPIRED)
 
                     # 最後一次 SQL 完成後才決定能否提交和交付。Session 列仍鎖定，期限不會被其他請求刷新。
-                    if sessions.utc_now() >= access.session_expires_at:
+                    if sessions.utc_now() >= current.session_expires_at:
                         raise AnswerDenied(401, SIGN_IN)
             except AnswerDenied as denied:
                 if denied.code != 401:

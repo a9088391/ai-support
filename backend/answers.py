@@ -1,4 +1,5 @@
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from threading import Event
@@ -258,7 +259,7 @@ async def run_search(
         search_attempt, settings, digest, attempt, query, deadline
     )
 
-    # 工具交易已確認證據在期限內且仍可讀；先保留快照再交回可取消的事件迴圈。
+    # 工具交易已保存可信證據；執行緒回傳值只用來分配本次交換的引用識別。
     for source in results:
         if source not in evidence:
             evidence.append(source)
@@ -372,6 +373,7 @@ async def ask(
     digest: bytes,
     form: NewQuestion | RetryQuestion,
     disconnected: Event,
+    admitted: Callable[[Attempt], Awaitable[None]] | None = None,
 ) -> AnswerResponse:
     # 單調時間控制本程序；UTC 期限讓其他程序只接手確定已逾期的嘗試。
     deadline_at = datetime.now(UTC) + timedelta(seconds=ATTEMPT_SECONDS)
@@ -390,6 +392,13 @@ async def ask(
     finished = False
     model_steps = None
     try:
+        # 串流只在受理提交後發出識別；傳送中斷仍經同一個收尾路徑停止嘗試。
+        if admitted is not None:
+            with anyio.move_on_after(max(0, deadline - monotonic())) as emission:
+                await admitted(attempt)
+            if emission.cancel_called:
+                raise AnswerDenied(503, "目前無法傳送問答受理資訊。")
+
         # 只取消本次操作；送達結算及終態寫入在期限取消後仍可完成。
         with anyio.move_on_after(max(0, deadline - monotonic())) as timeout:
             try:

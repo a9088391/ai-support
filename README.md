@@ -146,3 +146,43 @@ node tests/fixture-server.mjs invalid 18021
 `POST /api/answers` 需同源及有效的登入 Cookie，本文可為首題 `{"question":"…"}`、追問 `{"question":"…","conversation_id":"…"}`，或手動重試 `{"conversation_id":"…","question_id":"…","attempt_id":"…"}`。重試必須指定該問題目前失敗的嘗試；會回傳相同的對話和問題識別，以及新的嘗試識別。瀏覽器不能提交前文、模型步驟或引用。HTTP `200` 為本次嘗試的終態，包含 `conversation_id`、`question_id`、`attempt_id`、`status`、`answer`、`model`、`citations` 及 `search_results`。引用與搜尋結果使用上述知識片段欄位。只有 `answered` 帶回答與引用，其他終態（`insufficient_evidence`、`invalid_output`、`rate_limited`、`timed_out`、`unavailable`）仍可附上本次搜尋結果。欄位錯誤、未登入、來源驗證失敗及目前無法處理時，分別回傳 `422`、`401`、`403`、`503`。其他帳號或找不到的對話不公開資料，回傳 `404`；對話仍存在但已到期回傳 `410`；忙碌、達上限、過時重試或無可延續前文則回傳 `409`。
 
 `GET /api/answers/{attempt_id}` 可由有效登入的擁有者查閱該問題目前已完成且仍在暫存期限內的結果，不延長期限或再次呼叫模型。識別不存在、已被重試取代或不屬於目前帳號時回傳 `404`，尚未清理的到期結果回傳 `410`。工作台只在當前頁面記住問答識別，不提供歷史列表或恢復入口。
+
+### 非模型 API 效能
+
+在專案根目錄執行。確認沒有其他人在使用 `ai-support-perf`；每次須從空的測試資料庫開始。這段命令會印出結果目錄，保留原始 JSON、診斷與退出碼，並清除這次的隔離環境。
+
+```sh
+(
+  report_dir=$(mktemp -d) || exit
+  benchmark_rc=0
+  {
+    docker compose -p ai-support-perf -f compose.test.yaml build test >&2 &&
+    docker compose -p ai-support-perf -f compose.test.yaml run --rm -T test \
+      python -m backend.tests.performance > "$report_dir/performance.json"
+  } 2> "$report_dir/performance.stderr" || benchmark_rc=$?
+
+  cleanup_rc=0
+  docker compose -p ai-support-perf -f compose.test.yaml down --volumes \
+    > "$report_dir/cleanup.log" 2>&1 || cleanup_rc=$?
+  printf '%s\n' "$benchmark_rc" > "$report_dir/performance.exit"
+  printf 'benchmark=%s; cleanup=%s; report_dir=%s\n' "$benchmark_rc" "$cleanup_rc" "$report_dir"
+  if [ "$benchmark_rc" -ne 0 ]; then exit "$benchmark_rc"; fi
+  exit "$cleanup_rc"
+)
+```
+
+工具只接受指定的可拋棄 PostgreSQL 18，並拒絕已使用過的資料庫。HTTP 只走測試容器內的 loopback，使用合成帳號與資料，不讀取本機 Gemini Key。從暖機後的 1,000 張工單和 50 份文件開始，每秒送出 10 筆，連續 60 秒。搜尋、清單、明細、首次建單與客服結案各 120 筆，暖機與預期拒絕另外記錄。
+
+JSON 包含寫完 HTTP 請求的送出量、收到完整回應的筆數、各筆時間及錯誤、各類 p95 和資料讀回結果。重測時另記主機規格、Docker 容器配額，並用 `uptime` 和 `docker stats --no-stream` 取樣背景負載。延遲從 HTTP 客戶端開始呼叫算到收完回應本文；搜尋、清單及明細各需 p95 ≤500 ms，建單及結案各需 p95 ≤1,000 ms。送出量不足、超過門檻、非預期錯誤或資料不符，均回傳非零退出碼。
+
+2026-11-08 以 Apple M3（8 核心、24 GiB）、OrbStack（Docker VM 8 vCPU、11.73 GiB）及 PostgreSQL 18.6 實測。測試容器未另設 CPU 或記憶體上限；同機既有容器維持運作，通過輪的主機 1 分鐘負載取樣為 2.19–3.33。
+
+| API | 完成筆數 | p95 |
+| --- | ---: | ---: |
+| 搜尋 | 120 | 40.65 ms |
+| 工單清單 | 120 | 34.89 ms |
+| 工單明細 | 120 | 34.35 ms |
+| 建立工單 | 120 | 40.83 ms |
+| 客服結案 | 120 | 38.08 ms |
+
+共送出並完成 600 筆，每秒 10 筆，沒有非預期 HTTP 或資料錯誤。資料庫讀回 1,120 張工單，其中 121 張已結案（含暖機的一張）；模型請求及配額紀錄均為零。首輪有一個清單時槽未送出，599 筆未達標；以上為修正送出量計量後，以相同負載重跑的結果。本機基準僅反映這組資料、硬體與負載，真實模型延遲另行驗收。

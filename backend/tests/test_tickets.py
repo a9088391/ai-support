@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from operator import itemgetter
@@ -323,6 +324,108 @@ def test_ticket_close_http_permissions_and_resolution_limits(
         # 失去啟用資格後，既有客服登入也不能異動工單。
         answer_ready.key_file.unlink()
         assert support.post(close, headers=CSRF, json=valid).status_code == 503
+
+
+# 正常重啟沿用同一 PostgreSQL 與 Key，並保留開啟／結案工單及額度帳本。
+def test_normal_restart_preserves_open_and_closed_tickets(
+    answer_ready: Settings,
+    provider_script: ProviderScript,
+    mocked_provider: tuple[list[httpx.Request], list[Callable[[], httpx.Response]]],
+) -> None:
+    # 以同一讀取涵蓋啟用綁定、完整請求明細及每日使用量。
+    def persisted_model_state() -> tuple[object, ...]:
+        with answer_ready.connect() as conn:
+            return (
+                conn.execute(
+                    """
+                    SELECT key_version, fingerprint, provider, model, status,
+                           probe_sequence, verified_sequence
+                    FROM activation
+                    """
+                ).fetchone(),
+                conn.execute(
+                    """
+                    SELECT id, service_day, username, delivery, rejected_key_version,
+                           rejected_verified_sequence
+                    FROM model_requests ORDER BY id
+                    """
+                ).fetchall(),
+                conn.execute(
+                    "SELECT service_day, used FROM daily_model_quota ORDER BY service_day"
+                ).fetchall(),
+            )
+
+    # 分別記錄啟用與問答傳輸，讓重啟後能證明兩條路徑都沒有外呼。
+    activation_requests, _ = mocked_provider
+    provider_script.responses.extend([model_output(None, []), model_output(None, [])])
+
+    # 經真實 HTTP 入口建立兩張票，再由客服端點只結案其中一張。
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as client:
+        login(client)
+        ready = client.get("/api/setup")
+        assert ready.status_code == 200 and ready.json()["status"] == "ready"
+
+        opened = client.post(
+            TICKETS,
+            headers=CSRF,
+            json=ticket_form(ask(client), "重啟後仍開啟"),
+        )
+        assert opened.status_code == 200
+        open_ticket = opened.json()
+        assert open_ticket["status"] == "open"
+        assert open_ticket["resolution"] is None and open_ticket["closed_at"] is None
+
+        created = client.post(
+            TICKETS,
+            headers=CSRF,
+            json=ticket_form(ask(client), "重啟後仍結案"),
+        )
+        assert created.status_code == 200
+        ticket = created.json()
+        login(client, SUPPORT_FORM)
+        closed = client.post(
+            f"{TICKETS}/{ticket['id']}/close",
+            headers=CSRF,
+            json={"resolution": "已完成處理"},
+        )
+        assert closed.status_code == 200
+        closed_ticket = closed.json()
+        assert closed_ticket["status"] == "closed"
+        assert closed_ticket["resolution"] == "已完成處理"
+        assert closed_ticket["closed_at"]
+
+        # 把結案快照的來源留在有期限的執行中狀態，模擬程序中斷時的未完成問答。
+        with answer_ready.connect() as conn:
+            interrupted = conn.execute(
+                """
+                UPDATE answer_attempts
+                SET status = 'running', deadline_at = clock_timestamp() + interval '1 minute'
+                WHERE id = %s
+                RETURNING status
+                """,
+                (closed_ticket["attempt_id"],),
+            ).fetchone()
+        assert interrupted == ("running",)
+        assert client.get(f"{TICKETS}/{closed_ticket['id']}").json() == closed_ticket
+
+        # 讀取重啟前的完整模型紀錄及兩個替身已送出的內容作為不變基準。
+        before_restart = persisted_model_state()
+        activation_sent = list(activation_requests)
+        answers_sent = list(provider_script.requests)
+        assert len(activation_sent) == 1
+        assert len(answers_sent) == 2
+
+    # 新 app 會重跑真實 FastAPI lifespan，並使用相同資料庫設定與 Key 路徑。
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as restarted:
+        assert restarted.get("/api/setup").json() == ready.json()
+        login(restarted)
+        assert restarted.get(f"{TICKETS}/{open_ticket['id']}").json() == open_ticket
+        assert restarted.get(f"{TICKETS}/{closed_ticket['id']}").json() == closed_ticket
+
+    # 啟動、啟用狀態查詢與票務讀回均未改寫持久帳本或觸發任一模型傳輸。
+    assert persisted_model_state() == before_restart
+    assert activation_requests == activation_sent
+    assert provider_script.requests == answers_sent
 
 
 # 兩個獨立客服 Session 競爭同一張工單時，只保留勝出的結果及原快照。

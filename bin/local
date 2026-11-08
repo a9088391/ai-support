@@ -14,14 +14,110 @@ test_compose() {
     docker compose --env-file /dev/null -p ai-support-test -f compose.test.yaml "$@"
 }
 
+# 固定使用預覽時選定的本機 Docker socket，避免確認後改用其他 context。
+reset_docker() (
+    unset DOCKER_CONTEXT DOCKER_HOST
+    docker --host "$reset_socket" "$@"
+)
+
+# 先比對此 checkout 的資料庫容器和專屬磁碟區，才可向操作者詢問確認。
+reset_demo() {
+    # 僅接受本機 Unix socket；拒絕直接覆寫連線端點或改用遠端 Docker。
+    if [ -n "${DOCKER_HOST:-}" ] ||
+        ! reset_context=$(docker context show) ||
+        ! reset_socket=$(docker context inspect --format '{{.Endpoints.docker.Host}}' -- "$reset_context"); then
+        printf '%s\n' '無法確認本機 Docker 目標，重設已取消。' >&2
+        return 1
+    fi
+    case "$reset_socket" in
+        unix:///*) ;;
+        *)
+            printf '%s\n' '重設只接受本機 Unix socket。' >&2
+            return 1
+            ;;
+    esac
+
+    # Compose 只查詢執行中的 db；完整容器 ID 在確認後原樣用於執行。
+    root=$(pwd -P)
+    if ! db=$(reset_docker compose --env-file /dev/null -p ai-support -f "$root/compose.yaml" ps -q db) ||
+        [ -z "$db" ] ||
+        ! target=$(reset_docker inspect --type container --format '{{.Id}}
+{{.State.Running}}
+{{index .Config.Labels "com.docker.compose.project"}}
+{{index .Config.Labels "com.docker.compose.service"}}
+{{index .Config.Labels "com.docker.compose.project.config_files"}}
+{{range .Mounts}}{{if not (and (eq .Destination "/run/ai-support/database-password") (eq .Type "bind") (not .RW))}}{{println .Destination .Type .Name .RW}}{{end}}{{end}}' -- "$db"); then
+        printf '%s\n' '找不到此 checkout 的執行中資料庫，重設已取消。' >&2
+        return 1
+    fi
+
+    # 核對固定設定檔及本案的可寫磁碟區，其他掛載可能覆蓋實際資料目錄。
+    if [ "$target" != "$db
+true
+ai-support
+db
+$root/compose.yaml
+/var/lib/postgresql volume ai-support_database true" ] ||
+        ! volume=$(reset_docker volume inspect --format '{{index .Labels "com.docker.compose.project"}} {{index .Labels "com.docker.compose.volume"}} {{.Driver}} {{len .Options}}' ai-support_database) ||
+        [ "$volume" != 'ai-support database local 0' ]; then
+        printf '%s\n' '容器或磁碟區身分不符，重設已取消。' >&2
+        return 1
+    fi
+
+    # 預覽和輸入須在同一個終端，避免看不到範圍時仍能確認。
+    printf '%s\n' \
+        "目標：Docker $reset_context ($reset_socket)，$root/compose.yaml" \
+        "容器：${db}，磁碟區：ai-support_database，資料庫：ai_support" \
+        '清除：工單（含結案）、重送識別、暫存對話、問題及問答嘗試。' \
+        '保留：帳號、登入資料與限制、知識文件、本機設定、啟用紀錄及完整配額帳本。' >&2
+    if ! input_terminal=$(tty) ||
+        ! preview_terminal=$(tty <&2) ||
+        [ "$input_terminal" != "$preview_terminal" ]; then
+        printf '%s\n' '請讓輸入與預覽使用同一個互動式終端，重設已取消。' >&2
+        return 1
+    fi
+
+    # 比對包含換行的實際位元組，避免 shell 變數忽略 NUL 或沒有送出完整一行。
+    printf '%s' '輸入 RESET ai-support 確認清除，其餘輸入取消：' >&2
+    confirmation=$(head -n 1 | LC_ALL=C od -An -tx1)
+    expected=$(printf '%s\n' 'RESET ai-support' | LC_ALL=C od -An -tx1)
+    if [ "$confirmation" != "$expected" ]; then
+        printf '%s\n' '重設已取消。' >&2
+        return 1
+    fi
+
+    # 在同一交易內核對 PostgreSQL 18 實際資料目錄，並明列清除表以避免連帶清除其他表。
+    if ! reset_docker exec --interactive "$db" psql --no-psqlrc --no-password \
+        --host=/var/run/postgresql --port=5432 --username=ai_support --dbname=ai_support \
+        --quiet --single-transaction --set=ON_ERROR_STOP=1 --file=- <<'SQL'
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '15s';
+DO $$
+BEGIN
+    IF current_setting('data_directory') <> '/var/lib/postgresql/18/docker' THEN
+        RAISE EXCEPTION 'PostgreSQL 資料目錄不符合重設目標。';
+    END IF;
+END
+$$;
+TRUNCATE public.ticket_attempt_replays, public.tickets,
+    public.answer_attempts, public.questions, public.conversations;
+SQL
+    then
+        printf '%s\n' '未能確認重設完成。請查核資料及服務狀態後再決定是否重試。' >&2
+        return 1
+    fi
+    printf '%s\n' '已重設本案示範工單與暫存問答，配額帳本已保留。'
+}
+
 # 先驗證命令參數；Key 只能透過互動提示輸入。
+usage='用法：./bin/local {up|stop|set-key|verify-key|import-knowledge|reset-demo|test|check|stop-test}'
 if [ "$#" -ne 1 ]; then
-    printf '%s\n' '用法：./bin/local {up|stop|set-key|verify-key|import-knowledge|test|check|stop-test}' >&2
+    printf '%s\n' "$usage" >&2
     exit 2
 fi
 
 case "$1" in
-    up|stop|verify-key|import-knowledge)
+    up|stop|verify-key|import-knowledge|reset-demo)
         # 應用程式使用本機檔案的擁有者身分，密碼不經 Compose 環境變數。
         AI_SUPPORT_UID=$(id -u)
         AI_SUPPORT_GID=$(id -g)
@@ -49,6 +145,9 @@ case "$1" in
         # 只讀專案內的固定文件，透過 stdin 匯入執行中的後端並保留退出碼。
         app_compose exec -T app python -m backend.cli import-knowledge < knowledge/documents.json
         ;;
+    reset-demo)
+        reset_demo
+        ;;
     test)
         test_compose run --rm --build test
         ;;
@@ -65,7 +164,7 @@ case "$1" in
         test_compose stop
         ;;
     *)
-        printf '%s\n' '用法：./bin/local {up|stop|set-key|verify-key|import-knowledge|test|check|stop-test}' >&2
+        printf '%s\n' "$usage" >&2
         exit 2
         ;;
 esac

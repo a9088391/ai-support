@@ -2,6 +2,7 @@ import json
 import re
 from typing import Annotated
 
+from psycopg import Connection
 from psycopg.rows import class_row
 from psycopg.types.json import Jsonb
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
@@ -148,21 +149,29 @@ def search(settings: Settings, token: str | None, query: str) -> SearchResponse 
         if sessions.read_active_session(conn, digest, refresh=True) is None:
             return None
 
-        # 以單一 SELECT 取得完整舊批或新批。C collation 只折疊 ASCII 大小寫，
-        # strpos 不把百分號或底線當成樣式；依穩定來源識別排序後取有界結果。
-        with conn.cursor(row_factory=class_row(SearchResult)) as cursor:
-            cursor.execute(
-                """
-                SELECT d.id AS document_id, d.title, d.version,
-                       f.id AS fragment_id, f.text AS excerpt
-                FROM knowledge_documents AS d
-                CROSS JOIN LATERAL jsonb_to_recordset(d.fragments) AS f(id text, text text)
-                CROSS JOIN (SELECT lower(%s::text COLLATE "C") AS term) AS q
-                WHERE strpos(lower(d.title COLLATE "C"), q.term) > 0
-                   OR strpos(lower(f.text COLLATE "C"), q.term) > 0
-                ORDER BY d.id COLLATE "C", f.id COLLATE "C"
-                LIMIT %s
-                """,
-                (query, RESULT_LIMIT),
-            )
-            return SearchResponse(results=cursor.fetchall())
+        # 共用相同的字詞、排序與資料庫快照規則。
+        return SearchResponse(results=find_fragments(conn, query))
+
+
+# 單一 SELECT 讀取已提交的完整批次；呼叫端先在自己的交易驗證存取權。
+def find_fragments(
+    conn: Connection[tuple[object, ...]], query: str
+) -> list[SearchResult]:
+    # 以單一 SELECT 取得完整舊批或新批。C collation 只折疊 ASCII 大小寫，
+    # strpos 不把百分號或底線當成樣式；依穩定來源識別排序後取有界結果。
+    with conn.cursor(row_factory=class_row(SearchResult)) as cursor:
+        cursor.execute(
+            """
+            SELECT d.id AS document_id, d.title, d.version,
+                   f.id AS fragment_id, f.text AS excerpt
+            FROM knowledge_documents AS d
+            CROSS JOIN LATERAL jsonb_to_recordset(d.fragments) AS f(id text, text text)
+            CROSS JOIN (SELECT lower(%s::text COLLATE "C") AS term) AS q
+            WHERE strpos(lower(d.title COLLATE "C"), q.term) > 0
+               OR strpos(lower(f.text COLLATE "C"), q.term) > 0
+            ORDER BY d.id COLLATE "C", f.id COLLATE "C"
+            LIMIT %s
+            """,
+            (query, RESULT_LIMIT),
+        )
+        return cursor.fetchall()

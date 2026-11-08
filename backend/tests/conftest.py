@@ -1,5 +1,6 @@
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -34,7 +35,8 @@ def settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
     with current.connect() as conn:
         conn.execute(
             "TRUNCATE activation, model_requests, daily_model_quota, "
-            "login_sessions, demo_accounts, login_rate_limits, knowledge_documents"
+            "login_sessions, demo_accounts, login_rate_limits, knowledge_documents, "
+            "conversations, questions, answer_attempts"
         )
         conn.execute("INSERT INTO activation DEFAULT VALUES")
     write_private(
@@ -63,6 +65,12 @@ def mocked_provider(
     def send(_: httpx.HTTPTransport, request: httpx.Request) -> httpx.Response:
         assert request.url.host == "generativelanguage.googleapis.com"
         assert request.url.path == "/v1/interactions"
+        # 替身在實際 HTTP 傳輸入口模擬已連線、尚未寫入的同步 trace。
+        trace = request.extensions.get("trace")
+        if trace is not None:
+            cast(Callable[[str, dict[str, object]], None], trace)(
+                "http11.send_request_headers.started", {}
+            )
         requests.append(request)
         return responses.pop(0)()
 

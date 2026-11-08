@@ -1,8 +1,12 @@
+import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from ipaddress import ip_address
 from pathlib import Path
+from threading import Event
+from uuid import UUID
 
+import anyio
 import psycopg
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -11,8 +15,14 @@ from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import RequestResponseEndpoint
 
-from backend import knowledge, sessions
+from backend import answers, knowledge, sessions
 from backend.activation import setup_status
+from backend.answer_storage import (
+    AnswerDenied,
+    AnswerResponse,
+    purge_expired,
+    read_attempt,
+)
 from backend.credentials import CredentialError
 from backend.database import Settings, initialize
 from backend.http_security import LOCAL_HOSTS, ApiRequestMiddleware
@@ -21,6 +31,8 @@ STATIC = Path(__file__).parents[1] / "public"
 LOGIN_INVALID = "登入欄位格式不正確。"
 LOGIN_DENIED = "帳號或密碼不正確。"
 SEARCH_INVALID = "搜尋欄位格式不正確。"
+ANSWER_INVALID = "問題欄位格式不正確。"
+PURGE_INTERVAL_SECONDS = 240
 
 
 # 同一個來源用同一個標準 IP 表示；來源只取 ASGI 對端，無法以 HTTP 標頭改寫。
@@ -29,6 +41,29 @@ def login_source(request: Request) -> str:
         return str(ip_address(request.client.host)) if request.client else "unknown"
     except ValueError:
         return "unknown"
+
+
+# 等待瀏覽器斷線；取消操作本身，讓模型與配額結算沿同一條路徑收尾。
+async def watch_answer_disconnect(
+    request: Request, stop: anyio.CancelScope, disconnected: Event
+) -> None:
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
+    disconnected.set()
+    stop.cancel()
+
+
+# 以有界交易定期刪除已到期暫存；短暫資料庫錯誤不會停止 HTTP 或解除到期限制。
+async def clean_answers(settings: Settings) -> None:
+    delay = PURGE_INTERVAL_SECONDS
+    while True:
+        await anyio.sleep(delay)
+        try:
+            await run_in_threadpool(purge_expired, settings)
+            delay = PURGE_INTERVAL_SECONDS
+        except psycopg.Error:
+            # 短暫失敗後儘快補清；到期資料仍由讀取條件立即拒絕。
+            delay = 5
 
 
 # 建立單一同源服務；設定可由隔離測試明確傳入，正式環境從後端掛載讀取。
@@ -41,6 +76,7 @@ def create_app(settings: Settings | None = None, static: Path = STATIC) -> FastA
             current = settings or Settings.from_environment()
             await run_in_threadpool(initialize, current)
             await run_in_threadpool(sessions.initialize_accounts, current)
+            await run_in_threadpool(purge_expired, current)
             app.state.settings = current
         except CredentialError as error:
             raise RuntimeError(str(error)) from None
@@ -48,7 +84,13 @@ def create_app(settings: Settings | None = None, static: Path = STATIC) -> FastA
             raise RuntimeError(
                 "無法初始化本機資料庫，請檢查專案服務及本機設定。"
             ) from None
-        yield
+        # 關閉時結束清理工作；重啟只補清，不重送中斷的問答。
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(clean_answers, current)
+            try:
+                yield
+            finally:
+                tasks.cancel_scope.cancel()
 
     # 停用框架的公開開發文件路由，避免和產品同源頁面混用。
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -203,6 +245,73 @@ def create_app(settings: Settings | None = None, static: Path = STATIC) -> FastA
         if results is None:
             raise HTTPException(status_code=401, detail="請先登入。")
         return results
+
+    @app.post("/api/answers", response_model=AnswerResponse)
+    # 問答只接受本次問題；HTTP 斷線即取消工作，不繼續向模型送出後續步驟。
+    async def submit_answer(request: Request) -> AnswerResponse | Response:
+        # 中介層先驗證同源及大小；拒絕重複欄位與任何聲稱的前文。
+        types = request.headers.getlist("content-type")
+        if (
+            len(types) != 1
+            or types[0].split(";", 1)[0].strip().lower() != "application/json"
+        ):
+            raise HTTPException(status_code=422, detail=ANSWER_INVALID)
+        try:
+            form = answers.AnswerInput.model_validate(
+                knowledge.parse_json(await request.body())
+            )
+        except (ValueError, RecursionError):
+            raise HTTPException(status_code=422, detail=ANSWER_INVALID) from None
+        digest = sessions.token_digest(request.cookies.get(sessions.COOKIE_NAME))
+        if digest is None:
+            raise HTTPException(status_code=401, detail="請先登入。")
+
+        # 資料庫存取及模型寫入會重新驗證身分；監看工作只存活到本次請求完成。
+        try:
+            with anyio.CancelScope() as stop:
+                disconnected = Event()
+                observer = asyncio.create_task(
+                    watch_answer_disconnect(request, stop, disconnected)
+                )
+                try:
+                    return await answers.ask(
+                        request.app.state.settings,
+                        digest,
+                        form.question.strip(),
+                        disconnected,
+                    )
+                finally:
+                    # 即使已斷線也等待監看工作停止，避免遺留接收者。
+                    observer.cancel()
+                    with (
+                        anyio.CancelScope(shield=True),
+                        suppress(asyncio.CancelledError),
+                    ):
+                        await observer
+        except AnswerDenied as error:
+            raise HTTPException(status_code=error.code, detail=error.detail) from None
+        except psycopg.Error:
+            raise HTTPException(status_code=503, detail="目前無法完成問答。") from None
+        return Response(status_code=499)
+
+    @app.get("/api/answers/{attempt_id}")
+    # 依不透明嘗試識別讀回已完成的自有結果；不延長閒置期限。
+    def get_answer(request: Request, attempt_id: str) -> AnswerResponse:
+        digest = sessions.token_digest(request.cookies.get(sessions.COOKIE_NAME))
+        if digest is None:
+            raise HTTPException(status_code=401, detail="請先登入。")
+
+        # 畸形識別和找不到資料共用固定回覆，不回顯路徑內容。
+        try:
+            identifier = UUID(attempt_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="找不到這次問答。") from None
+        try:
+            return read_attempt(request.app.state.settings, digest, identifier)
+        except AnswerDenied as error:
+            raise HTTPException(status_code=error.code, detail=error.detail) from None
+        except psycopg.Error:
+            raise HTTPException(status_code=503, detail="目前無法查詢問答。") from None
 
     @app.get("/health")
     # 提供不會接觸模型的本機存活檢查。

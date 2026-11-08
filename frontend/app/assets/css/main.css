@@ -34,7 +34,8 @@ body {
 }
 
 button,
-input {
+input,
+textarea {
   font: inherit;
 }
 
@@ -55,6 +56,7 @@ button:hover:not(:disabled) {
 
 button:focus-visible,
 input:focus-visible,
+textarea:focus-visible,
 [tabindex="-1"]:focus-visible {
   outline: 3px solid #1591a5;
   outline-offset: 3px;
@@ -65,7 +67,8 @@ button:disabled {
   opacity: 0.72;
 }
 
-input {
+input,
+textarea {
   width: 100%;
   min-height: 2.9rem;
   padding: 0.65rem 0.75rem;
@@ -77,6 +80,15 @@ input {
 
 input:disabled {
   color: var(--muted);
+  background: #f2f5f7;
+}
+
+textarea {
+  min-width: 0;
+  resize: vertical;
+}
+
+textarea[readonly] {
   background: #f2f5f7;
 }
 
@@ -389,6 +401,7 @@ p {
   color: #304757;
 }
 
+.answer-workspace,
 .knowledge-search {
   max-width: 42rem;
   margin-top: 2rem;
@@ -427,6 +440,15 @@ p {
 .knowledge-search-state p,
 .knowledge-search-feedback p {
   margin: 0.35rem 0 0;
+}
+
+.answer-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.answer-workspace h4 {
+  margin: 1.2rem 0 0;
 }
 
 .knowledge-results {

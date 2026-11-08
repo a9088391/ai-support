@@ -1,12 +1,14 @@
 import fcntl
 import hashlib
+import ssl
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from threading import Barrier, Event
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+import httpcore
 import httpx
 import psycopg
 import pytest
@@ -390,11 +392,11 @@ def test_config_changes_before_send(
     set_key(settings.key_file, "fixture-old")
     reads = 0
 
-    # 第二次讀取發生在預留交易已完成之後，此時模擬本機操作人員替換 Key。
+    # 第三次讀取位於連線後、實際寫入前，模擬本機操作人員此時替換 Key。
     def rotated(path: Path) -> GeminiCredential | None:
         nonlocal reads
         reads += 1
-        if reads == 2:
+        if reads == 3:
             set_key(path, "fixture-new")
         return read_key(path)
 
@@ -402,6 +404,46 @@ def test_config_changes_before_send(
     monkeypatch.setattr(activation, "read_key", rotated)
     assert cli.main(["verify-key"]) == 1
     assert not requests
+    with TestClient(create_app(settings), base_url="http://localhost") as client:
+        assert_setup(client, "unverified")
+    with settings.connect() as conn:
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (0,)
+        assert conn.execute("SELECT delivery FROM model_requests").fetchone() == (
+            "unsent",
+        )
+
+
+# 預留期間已換 Key 時應在嘗試連線前取消，確定舊日額度可退回。
+def test_cli_refunds_reservation_when_key_changed_before_connect(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_key(settings.key_file, "fixture-before-connect")
+    connect_attempts: list[str] = []
+
+    # 預留本身仍是實際 PostgreSQL 寫入；在舊憑證讀取後立即公布新的設定。
+    def reserve_and_rotate(
+        conn: psycopg.Connection[tuple[object, ...]],
+        request_id: UUID,
+    ) -> date | None:
+        reserved_day = reserve_request(conn, request_id)
+        set_key(settings.key_file, "fixture-after-reservation")
+        return reserved_day
+
+    # 若程式錯誤地嘗試連線，模擬接線前故障，讓尚未送出的預留不可被誤判。
+    def fail_connect(
+        _: httpcore.SyncBackend,
+        host: str,
+        port: int,
+        **_kwargs: object,
+    ) -> httpcore.NetworkStream:
+        connect_attempts.append(host)
+        raise httpcore.ConnectError("fixture connection failed")
+
+    monkeypatch.setattr(activation, "reserve_request", reserve_and_rotate)
+    monkeypatch.setattr(httpcore.SyncBackend, "connect_tcp", fail_connect)
+    assert cli.main(["verify-key"]) == 1
+    assert connect_attempts == []
     with TestClient(create_app(settings), base_url="http://localhost") as client:
         assert_setup(client, "unverified")
     with settings.connect() as conn:
@@ -523,3 +565,67 @@ def test_concurrent_same_key_retains_ready(
         assert conn.execute("SELECT delivery FROM model_requests").fetchall() == [
             ("sent",),
         ]
+
+
+# CLI 同樣不能以昨日額度送出；在 TCP 連線時跨日，走真實同步 HTTP/1.1 寫入前檢查。
+def test_cli_refunds_old_day_if_connection_crosses_taipei_midnight(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    set_key(settings.key_file, "fixture-rollover")
+    writes: list[bytes] = []
+    next_day: list[date] = []
+
+    class FixtureStream(httpcore.NetworkStream):
+        # 傳輸層寫入才算送出；無外部連線或憑證。
+        def write(self, buffer: bytes, timeout: float | None = None) -> None:
+            writes.append(buffer)
+
+        # 保留可完成的回應，讓舊版確實暴露跨日仍會送出的行為。
+        def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+            body = success().content
+            return (
+                f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+            ).encode("ascii") + body
+
+        # 測試不持有真正的 socket。
+        def close(self) -> None:
+            return
+
+        # 不接觸外部 TLS，只保留正式網域的傳輸契約。
+        def start_tls(
+            self,
+            ssl_context: ssl.SSLContext,
+            server_hostname: str | None = None,
+            timeout: float | None = None,
+        ) -> httpcore.NetworkStream:
+            assert server_hostname == "generativelanguage.googleapis.com"
+            return self
+
+    # 使用已提交的 PostgreSQL 用量日期，確定跨日發生在預留之後。
+    def connect(
+        _: httpcore.SyncBackend, host: str, port: int, **_kwargs: object
+    ) -> httpcore.NetworkStream:
+        assert (host, port) == ("generativelanguage.googleapis.com", 443)
+        with settings.connect() as conn:
+            row = conn.execute("SELECT service_day FROM model_requests").fetchone()
+            assert row is not None and isinstance(row[0], date)
+            next_day.append(row[0] + timedelta(days=1))
+        return FixtureStream()
+
+    # 只注入實際寫入邊界所見日期，不改變 PostgreSQL 原始預留。
+    def wire_day() -> date:
+        return next_day[0]
+
+    monkeypatch.setattr(httpcore.SyncBackend, "connect_tcp", connect)
+    monkeypatch.setattr(activation, "service_day_now", wire_day, raising=False)
+    assert cli.main(["verify-key"]) == 1
+    assert writes == []
+    with settings.connect() as conn:
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (0,)
+        assert conn.execute("SELECT delivery FROM model_requests").fetchone() == (
+            "unsent",
+        )
+        assert conn.execute("SELECT status FROM activation").fetchone() == (
+            "unverified",
+        )

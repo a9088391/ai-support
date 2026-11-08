@@ -54,3 +54,49 @@ CREATE TABLE IF NOT EXISTS knowledge_documents (
     version text NOT NULL,
     fragments jsonb NOT NULL
 );
+
+-- 啟用探測的帳號欄為空，沿用原有歷史用量與送達紀錄。
+ALTER TABLE model_requests
+    ADD COLUMN IF NOT EXISTS username text REFERENCES demo_accounts (username);
+
+-- 已確認拒絕只在原請求保留 Key 版本與驗證序號；既有紀錄的這兩欄維持空值。
+ALTER TABLE model_requests
+    ADD COLUMN IF NOT EXISTS rejected_key_version uuid,
+    ADD COLUMN IF NOT EXISTS rejected_verified_sequence bigint;
+
+CREATE INDEX IF NOT EXISTS model_requests_rejected_binding
+    ON model_requests (rejected_key_version, rejected_verified_sequence)
+    WHERE rejected_key_version IS NOT NULL;
+
+-- 個人額度只計入已送出及狀態不明的請求。
+CREATE INDEX IF NOT EXISTS model_requests_account_quota
+    ON model_requests (username, service_day) WHERE delivery <> 'unsent';
+
+-- 單輪從新對話開始；到期後連同所屬問題與嘗試一併移除。
+CREATE TABLE IF NOT EXISTS conversations (
+    id uuid PRIMARY KEY,
+    username text NOT NULL REFERENCES demo_accounts (username),
+    created_at timestamptz NOT NULL,
+    last_seen_at timestamptz NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS questions (
+    id uuid PRIMARY KEY,
+    conversation_id uuid NOT NULL REFERENCES conversations (id) ON DELETE CASCADE,
+    question text NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS questions_by_conversation ON questions (conversation_id);
+
+-- 暫存快照獨立於可更新的知識文件；配額不隨暫存刪除。
+CREATE TABLE IF NOT EXISTS answer_attempts (
+    id uuid PRIMARY KEY,
+    question_id uuid NOT NULL REFERENCES questions (id) ON DELETE CASCADE,
+    status text NOT NULL CHECK (status IN ('running', 'stopped', 'answered',
+        'insufficient_evidence', 'invalid_output', 'rate_limited', 'timed_out', 'unavailable')),
+    answer text,
+    citations jsonb NOT NULL DEFAULT '[]',
+    search_results jsonb NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS answer_attempts_by_question ON answer_attempts (question_id);

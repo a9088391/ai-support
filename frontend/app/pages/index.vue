@@ -1,8 +1,19 @@
 <script setup lang="ts">
+import type { KnowledgeSearchResult } from "~/components/KnowledgeResultList.vue";
+
 const SETUP_MODEL = "gemini-3.5-flash-lite" as const;
 const REQUEST_TIMEOUT_MS = 10_000;
+// 模型嘗試最多六十秒，另外保留傳輸與後端結算時間。
+const ANSWER_REQUEST_TIMEOUT_MS = 75_000;
 const LOGOUT_UNCONFIRMED = "目前無法確認登出結果，請手動重試登出。";
 const MAX_KNOWLEDGE_QUERY_CODE_POINTS = 2_000;
+const MAX_QUESTION_CODE_POINTS = 2_000;
+const MAX_ANSWER_SOURCES = 40;
+const ANSWER_ID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
+// 與後端純文字契約一致，保留定位字元、換行與完整的代理字元對。
+const INVALID_QUESTION_CHARACTER =
+  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\ud800-\udfff]/u;
+const BLANK_PLAIN_TEXT = /^[\p{Z}\t\n\r]*$/u;
 const setupStatuses = [
   "unconfigured",
   "unverified",
@@ -25,16 +36,24 @@ interface IdentityDto {
   readonly role: Role;
 }
 
-interface KnowledgeSearchResult {
-  readonly document_id: string;
-  readonly title: string;
-  readonly version: string;
-  readonly fragment_id: string;
-  readonly excerpt: string;
-}
-
 interface KnowledgeSearchDto {
   readonly results: readonly KnowledgeSearchResult[];
+}
+
+const answerStatusMessages = {
+  answered: "",
+  insufficient_evidence: "本次搜尋沒有足夠依據回答這個問題。",
+  invalid_output: "本次回答未通過驗證。您可以查看已取得的搜尋結果。",
+  rate_limited: "模型請求已達額度或速率上限，請稍後再手動提出問題。",
+  timed_out: "本次問答已逾時。您可以查看已取得的搜尋結果。",
+  unavailable: "模型暫時無法使用，請稍後再手動提出問題。",
+} as const;
+
+interface AnswerOutput {
+  readonly status: keyof typeof answerStatusMessages;
+  readonly answer: string | null;
+  readonly citations: readonly KnowledgeSearchResult[];
+  readonly search_results: readonly KnowledgeSearchResult[];
 }
 
 type KnowledgeSearchState = "idle" | "loading" | "success" | "empty" | "error";
@@ -76,6 +95,14 @@ const knowledgeQueryError = ref("");
 const knowledgeSearchError = ref("");
 const knowledgeSearchState = ref<KnowledgeSearchState>("idle");
 const knowledgeResults = ref<KnowledgeSearchResult[]>([]);
+const answerQuestion = ref("");
+const submittedQuestion = ref("");
+const answerQuestionError = ref("");
+const answerFailure = ref("");
+const answerOutput = shallowRef<AnswerOutput | null>(null);
+const answerOperation = shallowRef<Operation | null>(null);
+const answerQuestionInput = ref<HTMLTextAreaElement | null>(null);
+const answerResultHeading = ref<HTMLElement | null>(null);
 const usernameInput = ref<HTMLInputElement | null>(null);
 const passwordInput = ref<HTMLInputElement | null>(null);
 const knowledgeQueryInput = ref<HTMLInputElement | null>(null);
@@ -88,7 +115,7 @@ const authFeedbackHeading = ref<HTMLElement | null>(null);
 const workbenchHeading = ref<HTMLElement | null>(null);
 const loginFeedbackHeading = ref<HTMLElement | null>(null);
 let knowledgeSearchController: AbortController | null = null;
-let knowledgeSetupReadback: Operation | null = null;
+let businessSetupReadback: Operation | null = null;
 
 // 認證忙碌狀態直接由唯一操作推導，避免維護重複旗標。
 const isAuthBusy = computed(() => activeOperation.value !== null);
@@ -206,30 +233,114 @@ function isKnowledgeSearchDto(value: unknown): value is KnowledgeSearchDto {
   }
 
   // 逐筆拒絕非物件、額外欄位或非文字片段。
-  return dto.results.every((item) => {
-    // 先拒絕陣列與 null，再檢查結果欄位。
+  return dto.results.every(isKnowledgeSearchResult);
+}
+
+// 搜尋及問答共用相同的片段欄位；各自的筆數上限由外層回應驗證。
+function isKnowledgeSearchResult(item: unknown): item is KnowledgeSearchResult {
+  // 先拒絕陣列與 null，再檢查結果欄位。
+  // prettier-ignore
+  if (
+    typeof item !== "object"
+    || item === null
+    || Array.isArray(item)
+  ) {
+    return false;
+  }
+
+  const result = item as Record<string, unknown>;
+
+  // 每筆只接受 API 定義的五個純文字欄位。
+  // prettier-ignore
+  return (
+    Object.keys(result).length === 5
+    && typeof result.document_id === "string"
+    && typeof result.title === "string"
+    && typeof result.version === "string"
+    && typeof result.fragment_id === "string"
+    && typeof result.excerpt === "string"
+  );
+}
+
+// 只接受後端產生的不透明問答識別，畫面不需要保存這些值。
+function isAnswerId(value: unknown): boolean {
+  return typeof value === "string" && ANSWER_ID.test(value);
+}
+
+// 確認問答終態與本次證據相符，僅保留畫面使用的欄位。
+function readAnswerOutput(value: unknown): AnswerOutput | null {
+  // 拒絕非物件的回應，再檢查固定外形。
+  // prettier-ignore
+  if (
+    typeof value !== "object"
+    || value === null
+    || Array.isArray(value)
+  ) {
+    return null;
+  }
+  const dto = value as Record<string, unknown>;
+  const { status, answer, citations, search_results } = dto;
+
+  // 未知狀態、模型、識別或片段不進入私人工作區。
+  // prettier-ignore
+  if (
+    Object.keys(dto).length !== 8
+    || !isAnswerId(dto.conversation_id)
+    || !isAnswerId(dto.question_id)
+    || !isAnswerId(dto.attempt_id)
+    || dto.model !== SETUP_MODEL
+    || typeof status !== "string"
+    || !Object.hasOwn(answerStatusMessages, status)
+    || !Array.isArray(citations)
+    || citations.length > MAX_ANSWER_SOURCES
+    || !citations.every(isKnowledgeSearchResult)
+    || !Array.isArray(search_results)
+    || search_results.length > MAX_ANSWER_SOURCES
+    || !search_results.every(isKnowledgeSearchResult)
+  ) {
+    return null;
+  }
+
+  // 以完整來源快照核對引用，允許同一片段在不同版本各自出現。
+  if (status === "answered") {
+    // 以完整欄位依序比對，不受 JSON 物件的欄位順序影響。
+    const sourceKey = (source: KnowledgeSearchResult) =>
+      JSON.stringify([
+        source.document_id,
+        source.title,
+        source.version,
+        source.fragment_id,
+        source.excerpt,
+      ]);
+    const sources = new Set(search_results.map(sourceKey));
+    const citedSources = new Set(citations.map(sourceKey));
+
+    // 成功回答須有文字及至少一筆唯一引用，且每筆都來自這次搜尋。
     // prettier-ignore
     if (
-      typeof item !== "object"
-      || item === null
-      || Array.isArray(item)
+      typeof answer !== "string"
+      || BLANK_PLAIN_TEXT.test(answer)
+      || citations.length === 0
+      || citedSources.size !== citations.length
+      || ![...citedSources].every(
+        // 拒絕搜尋快照未包含的引用，避免將其他來源呈現為本次證據。
+        (key) => sources.has(key),
+      )
     ) {
-      return false;
+      return null;
     }
+  } else if (answer !== null || citations.length !== 0) {
+    // 失敗回應只允許帶搜尋結果，不能帶未驗證的回答或引用。
+    return null;
+  }
 
-    const result = item as Record<string, unknown>;
-
-    // 每筆只接受 API 定義的五個純文字欄位。
-    // prettier-ignore
-    return (
-      Object.keys(result).length === 5
-      && typeof result.document_id === "string"
-      && typeof result.title === "string"
-      && typeof result.version === "string"
-      && typeof result.fragment_id === "string"
-      && typeof result.excerpt === "string"
-    );
-  });
+  // 識別只用來檢查回應，畫面只保留內容與結果狀態。
+  return {
+    status: status as AnswerOutput["status"],
+    answer,
+    citations,
+    search_results,
+  };
 }
 
 // 只讀取安全狀態與限流標頭，不顯示伺服器錯誤本文或診斷內容。
@@ -260,6 +371,7 @@ async function requestApi(
   path: string,
   operation: Operation,
   options: Parameters<typeof $fetch.raw>[1] = {},
+  timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<ApiResult> {
   // 每次請求可逾時，整個操作則由同一取消權涵蓋到 readback 結束。
   const controller = new AbortController();
@@ -274,7 +386,7 @@ async function requestApi(
   // 單次逾時只中止本次傳輸，操作本身仍可執行安全 readback。
   const timeoutId = setTimeout(() => {
     controller.abort();
-  }, REQUEST_TIMEOUT_MS);
+  }, timeoutMs);
 
   try {
     // 所有請求同源、停用快取與自動重試，Cookie 由瀏覽器自動管理。
@@ -371,7 +483,7 @@ async function recheckSetup(
   if (isForegroundCheck && operation.foregroundEpoch !== foregroundEpoch) {
     return "stale";
   }
-  // 搜尋自己的安全回讀若更新得較晚，舊前景結果不再寫入共享狀態。
+  // 工作台的安全回讀若更新得較晚，舊前景結果不再寫入共享狀態。
   if (readSequence !== setupReadSequence) {
     return "stale";
   }
@@ -419,8 +531,13 @@ function handleVisibilityChange(): void {
 
 // 回到前景時只確認啟用，避免被動更新工作階段的閒置時間。
 async function checkSetupOnForeground(): Promise<void> {
-  // 隱藏時不查詢；啟用畫面仍由使用者主動恢復。
-  if (document.visibilityState !== "visible" || !isServiceReady.value) {
+  // 不讓可能隨失焦而作廢的前景查詢搶先取代業務 503 回讀。
+  // prettier-ignore
+  if (
+    document.visibilityState !== "visible"
+    || !isServiceReady.value
+    || businessSetupReadback
+  ) {
     return;
   }
 
@@ -699,6 +816,66 @@ function handleKnowledgeQueryInput(): void {
   cancelKnowledgeSearch();
 }
 
+// 業務操作收到 401 時統一清除身分，並讓鍵盤使用者回到登入表單。
+function expireWorkbenchSession(message: string): void {
+  // 同步撤銷身分也會取消該工作階段尚未完成的搜尋及問答。
+  logoutPending.value = false;
+  identity.value = null;
+  authState.value = "signed-out";
+  authMessage.value = message;
+  focus(usernameInput);
+}
+
+// 業務 API 的 503 只讀回一次啟用狀態，由最新回讀決定整個工作台是否可用。
+async function recheckBusinessSetup(): Promise<"ready" | "stale" | "blocked"> {
+  // 回讀取代同一前景週期的檢查，避免較早的狀態覆蓋此次復原結果。
+  foregroundEpoch += 1;
+  lastForegroundCheckEpoch = foregroundEpoch;
+  foregroundCheckRequested = false;
+  const foregroundOperation = activeOperation.value;
+  if (foregroundOperation && foregroundOperation.foregroundEpoch !== null) {
+    // 先釋放前景讀取擁有權再取消，讓登出在回讀期間仍可執行。
+    activeOperation.value = null;
+    foregroundOperation.controller.abort();
+  }
+
+  // 回讀屬於工作階段；編輯查詢或問題只影響各自的畫面操作。
+  const readback: Operation = {
+    controller: new AbortController(),
+    foregroundEpoch: null,
+  };
+  businessSetupReadback?.controller.abort();
+  businessSetupReadback = readback;
+  const readSequence = ++setupReadSequence;
+  const result = await requestApi("/api/setup", readback, { method: "GET" });
+
+  // 只釋放自己的回讀；登出、卸載或較新的讀取都會撤銷共享狀態更新權。
+  if (businessSetupReadback !== readback) {
+    return "stale";
+  }
+  businessSetupReadback = null;
+  if (
+    readback.controller.signal.aborted ||
+    readSequence !== setupReadSequence
+  ) {
+    return "stale";
+  }
+
+  // 只有明確的 ready 能保留工作台；未啟用或無法確認都隱藏私人資料。
+  const nextSetup =
+    result.status === 200 && isSetupDto(result.data) ? result.data : null;
+  if (nextSetup?.status === "ready") {
+    return "ready";
+  }
+  setupStatus.value = nextSetup;
+  hasSetupError.value = nextSetup === null;
+  identity.value = null;
+  authState.value = nextSetup ? "signed-out" : "error";
+  authMessage.value = "";
+  focusSetupResult();
+  return "blocked";
+}
+
 // 搜尋已匯入知識片段，使用獨立取消權，不佔用登入或登出的操作鎖。
 async function submitKnowledgeSearch(): Promise<void> {
   // 僅允許 ready 且已登入的角色使用工作台搜尋。
@@ -762,12 +939,7 @@ async function submitKnowledgeSearch(): Promise<void> {
 
     // 明確 401 立即交回既有登入畫面，並把焦點放回帳號欄位。
     if (result.status === 401) {
-      cancelKnowledgeSearch();
-      logoutPending.value = false;
-      identity.value = null;
-      authState.value = "signed-out";
-      authMessage.value = "登入工作階段已失效，請重新登入後搜尋。";
-      focus(usernameInput);
+      expireWorkbenchSession("登入工作階段已失效，請重新登入後搜尋。");
       return;
     }
 
@@ -778,63 +950,15 @@ async function submitKnowledgeSearch(): Promise<void> {
       knowledgeSearchError.value =
         "搜尋要求未通過來源驗證，請重新載入本機頁面後重試。";
     } else if (result.status === 503) {
-      // 本次狀態回讀取代同一前景週期的檢查，避免兩個回應交錯。
-      foregroundEpoch += 1;
-      lastForegroundCheckEpoch = foregroundEpoch;
-      foregroundCheckRequested = false;
-      const foregroundOperation = activeOperation.value;
-      if (foregroundOperation && foregroundOperation.foregroundEpoch !== null) {
-        // 先釋放前景讀取擁有權再取消，保持有效登出不被搜尋鎖住。
-        activeOperation.value = null;
-        foregroundOperation.controller.abort();
-      }
-
-      // 回讀負責確認整個工作台的啟用狀態，編輯關鍵字只取消搜尋。
-      const readback: Operation = {
-        controller: new AbortController(),
-        foregroundEpoch: null,
-      };
-      knowledgeSetupReadback?.controller.abort();
-      knowledgeSetupReadback = readback;
-      const readSequence = ++setupReadSequence;
-      const setupResult = await requestApi("/api/setup", readback, {
-        method: "GET",
-      });
-
-      // 只釋放自己的回讀；身分失效或卸載後不得再更新工作台。
-      if (knowledgeSetupReadback !== readback) {
-        return;
-      }
-      knowledgeSetupReadback = null;
-      if (readback.controller.signal.aborted) {
-        return;
-      }
-
-      // 只有最新讀取可更新共享狀態；未啟用或無法確認都回到啟用說明。
-      const isLatestSetupRead = readSequence === setupReadSequence;
-      if (isLatestSetupRead) {
-        const nextSetup =
-          setupResult.status === 200 && isSetupDto(setupResult.data)
-            ? setupResult.data
-            : null;
-        if (nextSetup?.status !== "ready") {
-          setupStatus.value = nextSetup;
-          hasSetupError.value = nextSetup === null;
-          identity.value = null;
-          authState.value = nextSetup ? "signed-out" : "error";
-          authMessage.value = "";
-          focusSetupResult();
-          return;
-        }
-      }
-
       // 仍是原搜尋才顯示手動重試；遲到的回讀不改動新查詢或焦點。
+      const setupResult = await recheckBusinessSetup();
       if (!isCurrentKnowledgeSearch(operation, owner)) {
         return;
       }
-      knowledgeSearchError.value = isLatestSetupRead
-        ? "知識搜尋暫時無法使用，服務仍已啟用。請稍後手動重試。"
-        : "服務狀態已重新確認，請再次手動搜尋。";
+      knowledgeSearchError.value =
+        setupResult === "ready"
+          ? "知識搜尋暫時無法使用，服務仍已啟用。請稍後手動重試。"
+          : "知識搜尋暫時無法完成，請稍後手動搜尋。";
     } else {
       // 網路失敗、逾時及其他未知狀態都使用安全文案且不自動重試。
       knowledgeSearchError.value =
@@ -850,6 +974,146 @@ async function submitKnowledgeSearch(): Promise<void> {
       knowledgeSearchController = null;
     }
   }
+}
+
+// 清除頁面上的問答並取消等待，避免返回頁面或切換身分後讀到舊內容。
+function clearAnswer(): void {
+  // 先撤銷畫面更新權，再中止傳輸，遲到結果不能復原已清除的內容。
+  const operation = answerOperation.value;
+  answerOperation.value = null;
+  operation?.controller.abort();
+
+  // 問題、結果與錯誤只存在於當前登入且啟用的頁面。
+  answerQuestion.value = "";
+  submittedQuestion.value = "";
+  answerQuestionError.value = "";
+  answerFailure.value = "";
+  answerOutput.value = null;
+}
+
+// 只有原本的登入身分與等待操作可以接收本次問答。
+function isCurrentAnswer(operation: Operation, owner: IdentityDto): boolean {
+  // 頁面離開、登出或失去啟用後都不能交付私人結果。
+  // prettier-ignore
+  return (
+    answerOperation.value === operation
+    && isServiceReady.value
+    && identity.value === owner
+  );
+}
+
+// 使用與後端一致的純文字及 Unicode 上限，超限直接拒絕而不截斷。
+function validateQuestion(question: string): string {
+  // 先以 UTF-16 長度快速排除過長輸入，再以實際 Unicode 碼位精確計數。
+  if (
+    question.length > MAX_QUESTION_CODE_POINTS * 2 ||
+    Array.from(question).length > MAX_QUESTION_CODE_POINTS
+  ) {
+    return "問題不可超過 2,000 個 Unicode 字元。";
+  }
+
+  // 無效控制字元及未配對的代理字元不可送往後端。
+  if (INVALID_QUESTION_CHARACTER.test(question)) {
+    return "問題包含無法使用的字元，請修正後再提出。";
+  }
+
+  // 拒絕後端視為空白的文字，避免對空問題送出問答請求。
+  return BLANK_PLAIN_TEXT.test(question) ? "請輸入您的問題。" : "";
+}
+
+// 每次手動送出只建立一個新問題，等待模型時仍允許搜尋與登出。
+async function submitAnswer(): Promise<void> {
+  // 以原本的登入物件與獨立操作識別目前等待者，防止重複送出。
+  const owner = identity.value;
+  // prettier-ignore
+  if (
+    !isServiceReady.value
+    || !owner
+    || answerOperation.value
+  ) {
+    return;
+  }
+
+  // 驗證失敗聚焦原欄位，保留草稿讓使用者修正。
+  const question = answerQuestion.value;
+  answerQuestionError.value = validateQuestion(question);
+  if (answerQuestionError.value) {
+    focus(answerQuestionInput);
+    return;
+  }
+
+  // 固定本次問題快照與等待擁有權，並移除前一次結果及訊息。
+  const operation: Operation = {
+    controller: new AbortController(),
+    foregroundEpoch: null,
+  };
+  answerOperation.value = operation;
+  submittedQuestion.value = question;
+  answerOutput.value = null;
+  answerFailure.value = "";
+
+  try {
+    // 僅送出這一題；模型等待使用較長傳輸期限，禁止自動重送。
+    const result = await requestApi(
+      "/api/answers",
+      operation,
+      {
+        method: "POST",
+        body: { question },
+        headers: { "X-CSRF-Protection": "1" },
+      },
+      ANSWER_REQUEST_TIMEOUT_MS,
+    );
+    if (!isCurrentAnswer(operation, owner)) {
+      return;
+    }
+
+    // 身分到期時清除工作台並聚焦登入，不保留私人問題或搜尋結果。
+    if (result.status === 401) {
+      expireWorkbenchSession("登入工作階段已失效，請重新登入後提出問題。");
+      return;
+    }
+
+    // 啟用狀態回讀屬於工作台；返回後仍須確認本次問答的畫面擁有權。
+    if (result.status === 503) {
+      const setupResult = await recheckBusinessSetup();
+      if (!isCurrentAnswer(operation, owner)) {
+        return;
+      }
+      answerFailure.value =
+        setupResult === "ready"
+          ? "問答暫時無法使用，服務仍已啟用。請稍後再手動提出問題。"
+          : "問答暫時無法完成，請稍後再手動提出問題。";
+    } else if (result.status === 200) {
+      // 只有完整終態可交付回答或保留的搜尋結果。
+      answerOutput.value = readAnswerOutput(result.data);
+      if (!answerOutput.value) {
+        answerFailure.value = "問答回應格式無法確認，請稍後再手動提出問題。";
+      }
+    } else if (result.status === 422) {
+      // 後端仍是輸入驗證的最後防線，拒絕時讓使用者回到原欄位。
+      submittedQuestion.value = "";
+      answerQuestionError.value = "問題未通過格式檢查，請修正後再提出。";
+      focus(answerQuestionInput);
+      return;
+    } else if (result.status === 403) {
+      // 僅顯示固定復原方式，避免將服務端診斷送進畫面。
+      answerFailure.value =
+        "問答要求未通過來源驗證，請重新載入本機頁面後再試。";
+    } else {
+      // 網路錯誤或傳輸逾時無法證明後端未執行，等待使用者明確提出下一題。
+      answerFailure.value =
+        "目前無法確認問答結果，請檢查本機服務後再手動提出問題。";
+    }
+  } finally {
+    // 只釋放本次等待；清除頁面後開始的新操作不受舊回應影響。
+    if (answerOperation.value === operation) {
+      answerOperation.value = null;
+    }
+  }
+
+  // 先結束等待並排入畫面更新，下一個 Vue 更新週期才有結果標題可聚焦。
+  focus(answerResultHeading);
 }
 
 // 登出失敗或逾時時只讀回 session，避免盲目重送非冪等異動。
@@ -909,7 +1173,7 @@ watch(username, (next, previous) => {
   }
 });
 
-// 服務失效、身分清除或切換時立即取消搜尋及回讀，並清除可能私有的結果。
+// 服務失效、身分清除或切換時立即取消業務操作並清除私有內容。
 watch(
   [isServiceReady, identity],
   ([ready, currentIdentity], previous) => {
@@ -928,7 +1192,8 @@ watch(
       || identityChanged
     ) {
       cancelKnowledgeSearch();
-      knowledgeSetupReadback?.controller.abort();
+      clearAnswer();
+      businessSetupReadback?.controller.abort();
     }
   },
   { flush: "sync" },
@@ -942,6 +1207,8 @@ onMounted(() => {
   window.addEventListener("blur", leaveForeground);
   window.addEventListener("focus", checkSetupOnForeground);
   document.addEventListener("visibilitychange", handleVisibilityChange);
+  // 瀏覽器可能快取離開的頁面；離開時先撤銷問答，返回也不續聊。
+  window.addEventListener("pagehide", clearAnswer);
 });
 
 // 離開頁面時取消目前操作，使遲到回應不能更新卸載後的畫面。
@@ -950,10 +1217,12 @@ onBeforeUnmount(() => {
   window.removeEventListener("blur", leaveForeground);
   window.removeEventListener("focus", checkSetupOnForeground);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
+  window.removeEventListener("pagehide", clearAnswer);
 
-  // 工作台卸載時取消獨立搜尋及回讀，避免遲到結果留在新畫面。
+  // 工作台卸載時取消業務操作與回讀，避免遲到結果留在新畫面。
   cancelKnowledgeSearch();
-  knowledgeSetupReadback?.controller.abort();
+  clearAnswer();
+  businessSetupReadback?.controller.abort();
 
   // 先撤銷畫面更新權，再中止請求及其後續 readback。
   const operation = activeOperation.value;
@@ -1192,6 +1461,133 @@ onBeforeUnmount(() => {
           {{ authMessage }}
         </p>
 
+        <section class="answer-workspace" aria-labelledby="answer-title">
+          <p class="eyebrow">AI 問答</p>
+          <h2 id="answer-title">提出問題</h2>
+          <p class="knowledge-search-intro">
+            以本機知識文件尋找依據。每次送出一個新問題，請使用虛構、非敏感內容。
+          </p>
+
+          <form
+            class="login-form"
+            aria-labelledby="answer-title"
+            :aria-busy="answerOperation !== null"
+            novalidate
+            @submit.prevent="submitAnswer"
+          >
+            <div class="field-group">
+              <label for="answer-question">您的問題</label>
+              <textarea
+                id="answer-question"
+                ref="answerQuestionInput"
+                v-model="answerQuestion"
+                name="question"
+                rows="4"
+                required
+                autocomplete="off"
+                :readonly="answerOperation !== null"
+                :aria-invalid="answerQuestionError ? 'true' : undefined"
+                :aria-describedby="
+                  answerQuestionError
+                    ? 'answer-question-help answer-question-error'
+                    : 'answer-question-help'
+                "
+                @input="answerQuestionError = ''"
+              ></textarea>
+              <p id="answer-question-help" class="knowledge-search-help">
+                最多 2,000 個 Unicode 字元。
+              </p>
+              <p
+                v-if="answerQuestionError"
+                id="answer-question-error"
+                class="form-feedback"
+                role="alert"
+              >
+                {{ answerQuestionError }}
+              </p>
+            </div>
+            <button
+              type="submit"
+              class="primary-action"
+              :disabled="answerOperation !== null"
+            >
+              {{ answerOperation ? "問答處理中…" : "提出問題" }}
+            </button>
+          </form>
+
+          <section
+            v-if="submittedQuestion"
+            class="knowledge-search-state"
+            aria-labelledby="submitted-question-title"
+          >
+            <h3 id="submitted-question-title">本次問題</h3>
+            <p class="answer-text">{{ submittedQuestion }}</p>
+          </section>
+
+          <p
+            v-if="answerOperation"
+            class="knowledge-search-state"
+            role="status"
+          >
+            正在查詢知識文件並處理問題，請稍候。
+          </p>
+
+          <section
+            v-else-if="answerOutput?.status === 'answered'"
+            class="knowledge-search-state"
+            aria-labelledby="answer-result-title"
+          >
+            <h3
+              id="answer-result-title"
+              ref="answerResultHeading"
+              tabindex="-1"
+            >
+              回答
+            </h3>
+            <p class="knowledge-search-help">
+              模型 <code>{{ SETUP_MODEL }}</code>
+            </p>
+            <p class="answer-text">{{ answerOutput.answer }}</p>
+            <h4>引用來源</h4>
+            <KnowledgeResultList :results="answerOutput.citations" />
+          </section>
+
+          <template v-else-if="answerOutput || answerFailure">
+            <section
+              class="knowledge-search-feedback"
+              aria-labelledby="answer-error-title"
+              role="alert"
+            >
+              <h3
+                id="answer-error-title"
+                ref="answerResultHeading"
+                tabindex="-1"
+              >
+                問答未完成
+              </h3>
+              <p>
+                {{
+                  answerOutput
+                    ? answerStatusMessages[answerOutput.status]
+                    : answerFailure
+                }}
+              </p>
+            </section>
+            <section
+              v-if="answerOutput"
+              class="knowledge-results"
+              aria-labelledby="answer-search-results-title"
+            >
+              <h3 id="answer-search-results-title">本次已取得的搜尋結果</h3>
+              <KnowledgeResultList
+                v-if="answerOutput.search_results.length"
+                :results="answerOutput.search_results"
+              />
+              <p v-else>本次問答沒有取得符合的知識片段。</p>
+            </section>
+          </template>
+        </section>
+
         <section
           class="knowledge-search"
           aria-labelledby="knowledge-search-title"
@@ -1288,38 +1684,7 @@ onBeforeUnmount(() => {
               <p role="status">
                 找到 {{ knowledgeResults.length }} 筆知識片段。
               </p>
-              <ul class="knowledge-result-list">
-                <li
-                  v-for="result in knowledgeResults"
-                  :key="`${result.document_id}:${result.fragment_id}`"
-                  class="knowledge-result"
-                >
-                  <dl class="knowledge-result-details">
-                    <div>
-                      <dt>標題</dt>
-                      <dd>{{ result.title }}</dd>
-                    </div>
-                    <div>
-                      <dt>版本</dt>
-                      <dd>
-                        <code>{{ result.version }}</code>
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>來源</dt>
-                      <dd>
-                        文件 <code>{{ result.document_id }}</code
-                        >，片段
-                        <code>{{ result.fragment_id }}</code>
-                      </dd>
-                    </div>
-                    <div class="knowledge-result-excerpt">
-                      <dt>完整摘錄</dt>
-                      <dd>{{ result.excerpt }}</dd>
-                    </div>
-                  </dl>
-                </li>
-              </ul>
+              <KnowledgeResultList :results="knowledgeResults" />
             </template>
           </section>
         </section>

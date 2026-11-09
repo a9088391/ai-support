@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from math import floor
 from threading import Event
@@ -105,6 +105,7 @@ class Attempt:
     access: Access
     question: str
     history: list[StepParam]
+    delivered_answers: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -209,13 +210,31 @@ def admit_conversation_window(
     return expiry
 
 
-# 只載入較早成功問題的完整交換，不重建簽章或採信失敗嘗試的部分結果。
+# 只讀原始最終回答文字作差異比較，兼容舊 JSON；不重建或覆寫簽章步驟。
+def history_answer(steps: list[StepParam]) -> str | None:
+    for step in reversed(steps):
+        if step.get("type") != "model_output":
+            continue
+        match step:
+            case {"content": [{"type": "text", "text": str(text)}]}:
+                try:
+                    parsed = knowledge.parse_json(text.encode("utf-8"))
+                except (ValueError, RecursionError):
+                    return None
+                match parsed:
+                    case {"answer": str(answer)}:
+                        return answer
+        return None
+    return None
+
+
+# 成功前文與交付答案取同一快照；只補差異脈絡，原始交換仍完整保留。
 def load_history(
     conn: psycopg.Connection[tuple[object, ...]], conversation_id: UUID, position: int
-) -> list[StepParam]:
+) -> tuple[list[StepParam], list[dict[str, str]]]:
     rows = conn.execute(
         """
-        SELECT a.model_steps FROM questions q
+        SELECT a.model_steps, q.question, a.answer FROM questions q
         JOIN answer_attempts a ON a.question_id = q.id
         WHERE q.conversation_id = %s AND q.position < %s AND a.status = 'answered'
         ORDER BY q.position
@@ -224,9 +243,16 @@ def load_history(
     ).fetchall()
 
     # 舊回答仍可讀取，但無原始步驟就不能冒充完整的可信前文。
-    if any(steps is None for (steps,) in rows):
+    if any(steps is None for steps, _, _ in rows):
         raise AnswerDenied(409, "這段對話缺少可延續的前文，請開始新的對話。")
-    return [step for (steps,) in rows for step in cast(list[StepParam], steps)]
+    history: list[StepParam] = []
+    delivered: list[dict[str, str]] = []
+    for steps, question, answer in rows:
+        exchange = cast(list[StepParam], steps)
+        history.extend(exchange)
+        if isinstance(answer, str) and history_answer(exchange) != answer:
+            delivered.append({"question": cast(str, question), "answer": answer})
+    return history, delivered
 
 
 # 先驗證身分再鎖對話；登入已到期時，先提交撤銷再回傳拒絕。
@@ -344,8 +370,10 @@ def admit_attempt(
         if position > QUESTION_LIMIT:
             raise AnswerDenied(409, "這段對話已達 10 題上限，請開始新的對話。")
         question_id, question, number = uuid4(), form.question.strip(), 1
-    history = (
-        [] if conversation_id is None else load_history(conn, conversation_id, position)
+    history, delivered = (
+        ([], [])
+        if conversation_id is None
+        else load_history(conn, conversation_id, position)
     )
 
     # 通過狀態檢查才刷新 Session；等候資料期間到期或換 Key 仍不可提交新嘗試。
@@ -400,7 +428,13 @@ def admit_attempt(
     if expiry is not None and sessions.utc_now() >= expiry:
         raise AnswerDenied(410, EXPIRED)
     return Attempt(
-        conversation_id, question_id, attempt_id, final_access, question, history
+        conversation_id,
+        question_id,
+        attempt_id,
+        final_access,
+        question,
+        history,
+        delivered,
     )
 
 
@@ -519,7 +553,7 @@ def revoke_dispatch_session(
 # 搜尋由伺服器授權並使用與公開搜尋相同的查詢；讀取後再次確認工作階段期限。
 def search_attempt(
     settings: Settings, digest: bytes, attempt: Attempt, query: str, deadline: float
-) -> list[knowledge.SearchResult]:
+) -> list[knowledge.SearchEvidence]:
     with settings.connect() as conn:
         bound_transaction(conn, deadline)
         access = authorize(conn, settings, digest, deadline=deadline)
@@ -533,7 +567,7 @@ def search_attempt(
                     deadline, monotonic() + check_attempt_window(window)
                 )
                 bound_transaction(conn, query_deadline)
-                results = knowledge.find_fragments(conn, query)
+                results = knowledge.find_evidence(conn, query)
                 require_time(query_deadline)
 
                 # 只有期限內且仍經授權的真實結果可交給模型或保留為證據。
@@ -545,7 +579,9 @@ def search_attempt(
                         # 搜尋完成就保存快照；建單及終態寫入不依賴執行緒收到這次回傳值。
                         with conn.transaction():
                             if results:
-                                persist_search_results(conn, attempt.id, results)
+                                persist_search_results(
+                                    conn, attempt.id, [item.source for item in results]
+                                )
                             access = authorize(
                                 conn, settings, digest, deadline=query_deadline
                             )

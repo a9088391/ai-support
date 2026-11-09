@@ -636,3 +636,93 @@ def test_search_survives_provider_error(
     assert len(requests) == 2
     with settings.connect() as conn:
         assert conn.execute("SELECT used FROM daily_model_quota").fetchall() == [(2,)]
+
+
+# 新增可選 metadata 不改變舊 JSONB；非法事實須在整批替換前拒絕。
+def test_permission_import_preserves_legacy_and_validates_facts(
+    ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 舊批次匯入後保留原欄位，不能因預設值多寫 null 或空陣列。
+    assert import_batch(monkeypatch, ORIGINAL) == 0
+    with ready.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, fragments FROM knowledge_documents ORDER BY id"
+        ).fetchall()
+    for document in ORIGINAL["documents"]:
+        assert (document["id"], document["fragments"]) in rows
+
+    # 嚴格型別、列舉與必填欄位均由現有 CLI 驗證，錯誤不替換舊資料。
+    fact = {
+        "role": "viewer",
+        "action": "read",
+        "resource": "shared_reports",
+        "effect": "allow",
+    }
+    for permissions in (
+        [{**fact, "effect": True}],
+        [{**fact, "effect": "unknown"}],
+        [{"role": "viewer"}],
+        "allow",
+    ):
+        batch = {
+            "documents": [
+                {
+                    **UPDATED_DOCUMENT,
+                    "fragments": [{**UPDATED_FRAGMENT, "permissions": permissions}],
+                }
+            ]
+        }
+        assert import_batch(monkeypatch, batch) == 1
+    with ready.connect() as conn:
+        assert (
+            conn.execute(
+                "SELECT id, fragments FROM knowledge_documents ORDER BY id"
+            ).fetchall()
+            == rows
+        )
+
+
+@pytest.mark.parametrize(
+    "recipient",
+    [
+        {"role": "owner"},
+        {"role": "owner", "label": " "},
+        {"role": "Owner", "label": "工作區擁有者"},
+        {"role": "owner", "label": True},
+        {"role": "owner", "label": "工作區擁有者", "unknown": True},
+    ],
+)
+# 申請對象沿用嚴格匯入契約，缺欄、空白或型別錯誤都不能成為回答事實。
+def test_application_recipient_validation(recipient: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        knowledge.Permission.model_validate(
+            {
+                "role": "viewer",
+                "action": "modify",
+                "resource": "workspace_settings",
+                "effect": "deny",
+                "application_recipient": recipient,
+            }
+        )
+
+
+# 只有禁止事實能帶申請對象；舊事實匯出仍不增加 null 欄位。
+def test_application_recipient_requires_denial_and_preserves_legacy() -> None:
+    fact = {
+        "role": "viewer",
+        "action": "modify",
+        "resource": "workspace_settings",
+        "effect": "deny",
+    }
+    assert (
+        knowledge.Permission.model_validate(fact).model_dump(exclude_none=True) == fact
+    )
+    recipient = {"role": "owner", "label": "工作區擁有者"}
+    updated = fact | {"application_recipient": recipient}
+    assert (
+        knowledge.Permission.model_validate(updated).model_dump(exclude_none=True)
+        == updated
+    )
+    with pytest.raises(ValueError):
+        knowledge.Permission.model_validate(updated | {"effect": "allow"})

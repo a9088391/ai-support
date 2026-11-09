@@ -3,7 +3,7 @@ import hashlib
 import ssl
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 from threading import Barrier, Event
 from uuid import UUID, uuid4
@@ -15,7 +15,7 @@ import pytest
 from backend import activation, cli, credentials
 from backend.app import create_app
 from backend.credentials import GeminiCredential, read_key, set_key
-from backend.database import Settings, initialize, reserve_request
+from backend.database import Settings, initialize, reserve_request, settle_request
 from backend.provider import MODEL
 from backend.tests.test_provider import SUCCESS
 from fastapi.testclient import TestClient
@@ -145,6 +145,7 @@ def test_provider_errors(
     settings: Settings,
     mocked_provider: tuple[list[httpx.Request], list[Callable[[], httpx.Response]]],
     initially_ready: bool,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     requests, responses = mocked_provider
     set_key(settings.key_file, "fixture-secret")
@@ -177,10 +178,16 @@ def test_provider_errors(
             assert cli.main(["verify-key"]) == 0
         expected = "ready" if initially_ready else "unverified"
 
-        for reply in (limited, timeout):
-            responses.append(reply)
-            assert cli.main(["verify-key"]) == 1
-            assert_setup(client, expected)
+        capsys.readouterr()
+        responses.append(limited)
+        assert cli.main(["verify-key"]) == 1
+        message = capsys.readouterr().err
+        assert "429" in message and "fixture-secret" not in message
+        assert_setup(client, expected)
+
+        responses.append(timeout)
+        assert cli.main(["verify-key"]) == 1
+        assert_setup(client, expected)
 
         responses.append(rejected)
         assert cli.main(["verify-key"]) == 1
@@ -232,21 +239,49 @@ def test_late_probe_cannot_overwrite_new_config(
         assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (2,)
 
 
-# 兩個獨立交易競爭臺灣當日最後一筆額度；只允許一個成功送出。
-def test_cli_quota_race(
+# 舊版帳本原地升級，兩個競爭的 CLI 都可越過舊上限並保留原值。
+def test_cli_upgrades_legacy_ledger_and_records_concurrent_requests(
     settings: Settings,
     mocked_provider: tuple[list[httpx.Request], list[Callable[[], httpx.Response]]],
 ) -> None:
     requests, responses = mocked_provider
     set_key(settings.key_file, "fixture-secret")
 
-    # 建立接近上限的起始資料，兩個 CLI 會各自執行真正的 PostgreSQL 交易。
+    # 先用 CLI 留下一筆已就緒的紀錄，再重建舊版 PostgreSQL 限制及當日用量。
+    responses.append(success)
+    assert cli.main(["verify-key"]) == 0
     with settings.connect() as conn:
+        conn.execute("UPDATE daily_model_quota SET used = 99")
         conn.execute(
-            "INSERT INTO daily_model_quota VALUES ((clock_timestamp() AT TIME ZONE 'Asia/Taipei')::date, 99)"
+            """INSERT INTO model_requests (id, service_day, delivery)
+               SELECT gen_random_uuid(), service_day, 'sent'
+               FROM daily_model_quota CROSS JOIN generate_series(1, 98)"""
         )
+        conn.execute(
+            """
+            ALTER TABLE daily_model_quota
+                DROP CONSTRAINT IF EXISTS daily_model_quota_used_nonnegative,
+                DROP CONSTRAINT IF EXISTS daily_model_quota_used_check,
+                ADD CONSTRAINT daily_model_quota_used_check CHECK (used BETWEEN 0 AND 100)
+            """
+        )
+        original = conn.execute("SELECT * FROM model_requests ORDER BY id").fetchall()
+        binding = conn.execute("SELECT * FROM activation").fetchone()
 
-    # 同步起跑，觀察有效驗證只消耗剩下的一筆。
+    # 初始化可重跑且保留歷史、驗證指紋及既有用量。
+    initialize(settings)
+    with ThreadPoolExecutor(1) as pool, settings.connect() as conn:
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (99,)
+        pool.submit(initialize, settings).result(timeout=5)
+        assert (
+            conn.execute("SELECT * FROM model_requests ORDER BY id").fetchall()
+            == original
+        )
+        assert conn.execute("SELECT * FROM activation").fetchone() == binding
+    with pytest.raises(psycopg.errors.CheckViolation), settings.connect() as conn:
+        conn.execute("UPDATE daily_model_quota SET used = -1")
+
+    # 同步起跑，兩筆驗證請求都必須送出並原子增加原本的同日用量。
     barrier = Barrier(2, timeout=8)
 
     # 等兩個執行緒都到齊才執行同一個 CLI 入口。
@@ -254,19 +289,23 @@ def test_cli_quota_race(
         barrier.wait()
         return cli.main(["verify-key"])
 
-    responses.append(success)
+    responses.extend((success, success))
     with ThreadPoolExecutor(2) as pool:
         first = pool.submit(run)
         second = pool.submit(run)
-        assert sorted((first.result(timeout=8), second.result(timeout=8))) == [0, 1]
-    assert len(requests) == 1
+        assert 0 in (first.result(timeout=8), second.result(timeout=8))
+    assert len(requests) == 3
 
-    # 重跑初始化與新連線都讀到相同上限，CLI 不會重複外呼。
-    initialize(settings)
-    assert cli.main(["verify-key"]) == 1
-    assert len(requests) == 1
+    # 新應用仍為就緒，讀回原有紀錄及兩筆已送出明細，重啟不會自動外呼。
+    with TestClient(create_app(settings), base_url="http://localhost") as client:
+        assert_setup(client, "ready")
+    assert len(requests) == 3
     with settings.connect() as conn:
-        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (100,)
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (101,)
+        assert conn.execute(
+            "SELECT count(*) FROM model_requests WHERE delivery = 'sent'"
+        ).fetchone() == (101,)
+        assert set(original) <= set(conn.execute("SELECT * FROM model_requests"))
 
 
 # 以原子預留的資料庫入口注入 UTC 時刻，驗證臺灣日期在邊界正確切換。
@@ -274,21 +313,40 @@ def test_quota_taipei_midnight(settings: Settings) -> None:
     # 固定在臺灣午夜前一瞬間及午夜整點，讓真實 SQL 選擇日期。
     before = datetime(2026, 11, 7, 15, 59, 59, 999999, tzinfo=UTC)
     midnight = datetime(2026, 11, 7, 16, 0, tzinfo=UTC)
+    cancelled = uuid4()
     with settings.connect() as conn:
         conn.execute(
             "INSERT INTO daily_model_quota VALUES (%s, 100)", (date(2026, 11, 7),)
         )
-        assert not reserve_request(conn, uuid4(), at=before)
-        assert reserve_request(conn, uuid4(), at=midnight)
+        assert reserve_request(conn, cancelled, at=before) == date(2026, 11, 7)
+        assert reserve_request(conn, uuid4(), at=midnight) == date(2026, 11, 8)
 
     # 新的日期有獨立計數，預留時先標為送達不明以防程序中止。
     with settings.connect() as conn:
         assert conn.execute(
             "SELECT service_day, used FROM daily_model_quota ORDER BY service_day"
+        ).fetchall() == [(date(2026, 11, 7), 101), (date(2026, 11, 8), 1)]
+        assert conn.execute(
+            "SELECT service_day, delivery FROM model_requests ORDER BY service_day"
+        ).fetchall() == [
+            (date(2026, 11, 7), "unknown"),
+            (date(2026, 11, 8), "unknown"),
+        ]
+
+    # 新日期已入帳後取消舊預留；跨交易重複結算也只退回原日一次。
+    for _ in range(2):
+        with settings.connect() as conn:
+            settle_request(conn, cancelled, "unsent")
+    with settings.connect() as conn:
+        assert conn.execute(
+            "SELECT service_day, used FROM daily_model_quota ORDER BY service_day"
         ).fetchall() == [(date(2026, 11, 7), 100), (date(2026, 11, 8), 1)]
-        assert conn.execute("SELECT delivery FROM model_requests").fetchone() == (
-            "unknown",
-        )
+        assert conn.execute(
+            "SELECT service_day, delivery FROM model_requests ORDER BY service_day"
+        ).fetchall() == [
+            (date(2026, 11, 7), "unsent"),
+            (date(2026, 11, 8), "unknown"),
+        ]
 
 
 # 檢查同源靜態輸出不會將未定義 API 改寫為 HTML 或讀出根目錄外檔案。
@@ -567,21 +625,54 @@ def test_concurrent_same_key_retains_ready(
         ]
 
 
-# CLI 同樣不能以昨日額度送出；在 TCP 連線時跨日，走真實同步 HTTP/1.1 寫入前檢查。
-def test_cli_refunds_old_day_if_connection_crosses_taipei_midnight(
+# 以真實預留交易模擬臺灣午夜前最後一瞬間，保留原請求及帳號。
+def reserve_before_taipei_midnight(
+    conn: psycopg.Connection[tuple[object, ...]],
+    request_id: UUID,
+    *,
+    username: str | None = None,
+) -> date:
+    row = conn.execute(
+        "SELECT date_trunc('day', clock_timestamp(), 'Asia/Taipei') - interval '1 microsecond'"
+    ).fetchone()
+    assert row is not None and isinstance(row[0], datetime)
+    return reserve_request(conn, request_id, at=row[0], username=username)
+
+
+# 在傳輸寫入邊界檢查已提交的預留日早於 PostgreSQL 所見臺灣日期。
+def assert_previous_day_reservation(
+    settings: Settings, username: str | None = None
+) -> date:
+    with settings.connect() as conn:
+        row = conn.execute(
+            """SELECT service_day, delivery, (clock_timestamp() AT TIME ZONE 'Asia/Taipei')::date
+               FROM model_requests WHERE username IS NOT DISTINCT FROM %s""",
+            (username,),
+        ).fetchone()
+    assert row is not None
+    reserved_day, delivery, wire_day = row
+    assert isinstance(reserved_day, date) and isinstance(wire_day, date)
+    assert reserved_day < wire_day and delivery == "unknown"
+    return reserved_day
+
+
+# CLI 已跨臺灣日界仍可送出，且走真實同步 HTTP/1.1 寫入前檢查。
+def test_cli_keeps_reservation_day_if_connection_crosses_taipei_midnight(
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     set_key(settings.key_file, "fixture-rollover")
     writes: list[bytes] = []
-    next_day: list[date] = []
+    reserved_days: list[date] = []
 
     class FixtureStream(httpcore.NetworkStream):
         # 傳輸層寫入才算送出；無外部連線或憑證。
         def write(self, buffer: bytes, timeout: float | None = None) -> None:
+            if not writes:
+                reserved_days.append(assert_previous_day_reservation(settings))
             writes.append(buffer)
 
-        # 保留可完成的回應，讓舊版確實暴露跨日仍會送出的行為。
+        # 供應商可正常驗證，讓測試區分跨日遭拒與成功送出。
         def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
             body = success().content
             return (
@@ -602,30 +693,26 @@ def test_cli_refunds_old_day_if_connection_crosses_taipei_midnight(
             assert server_hostname == "generativelanguage.googleapis.com"
             return self
 
-    # 使用已提交的 PostgreSQL 用量日期，確定跨日發生在預留之後。
+    # 只替換 TCP 串流，保留 SDK 的 HTTP 寫入檢查。
     def connect(
         _: httpcore.SyncBackend, host: str, port: int, **_kwargs: object
     ) -> httpcore.NetworkStream:
         assert (host, port) == ("generativelanguage.googleapis.com", 443)
-        with settings.connect() as conn:
-            row = conn.execute("SELECT service_day FROM model_requests").fetchone()
-            assert row is not None and isinstance(row[0], date)
-            next_day.append(row[0] + timedelta(days=1))
         return FixtureStream()
 
-    # 只注入實際寫入邊界所見日期，不改變 PostgreSQL 原始預留。
-    def wire_day() -> date:
-        return next_day[0]
-
+    # CLI 正常啟用並送出一筆請求；只有預留時間固定在午夜前。
+    monkeypatch.setattr(activation, "reserve_request", reserve_before_taipei_midnight)
     monkeypatch.setattr(httpcore.SyncBackend, "connect_tcp", connect)
-    monkeypatch.setattr(activation, "service_day_now", wire_day, raising=False)
-    assert cli.main(["verify-key"]) == 1
-    assert writes == []
+    assert cli.main(["verify-key"]) == 0
+    assert b"".join(writes).count(b"POST /v1/interactions HTTP/1.1") == 1
+    (original_day,) = reserved_days
+    # 已送出維持原用量日；公開啟用狀態必須可用。
     with settings.connect() as conn:
-        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (0,)
-        assert conn.execute("SELECT delivery FROM model_requests").fetchone() == (
-            "unsent",
-        )
-        assert conn.execute("SELECT status FROM activation").fetchone() == (
-            "unverified",
-        )
+        assert conn.execute(
+            "SELECT service_day, used FROM daily_model_quota"
+        ).fetchall() == [(original_day, 1)]
+        assert conn.execute(
+            "SELECT service_day, delivery FROM model_requests"
+        ).fetchall() == [(original_day, "sent")]
+    with TestClient(create_app(settings), base_url="http://localhost") as client:
+        assert_setup(client, "ready")

@@ -5,7 +5,7 @@ from psycopg import Connection, DatabaseError
 from pydantic import BaseModel
 
 from backend.credentials import CredentialError, GeminiCredential, read_key
-from backend.database import Settings, reserve_request, service_day_now, settle_request
+from backend.database import Settings, reserve_request, settle_request
 from backend.provider import MODEL, PROVIDER, ProbeOutcome, request_verification
 
 SetupState = Literal["unconfigured", "unverified", "ready", "invalid"]
@@ -89,7 +89,7 @@ def activation_binding(
     return SetupResponse(status=status, message=MESSAGES[status]), None, 0
 
 
-# 只有本機 CLI 呼叫此流程，將額度預留、唯一外呼與結果寫回切成明確邊界。
+# 只有本機 CLI 呼叫此流程，將用量預留、唯一外呼與結果寫回切成明確邊界。
 def verify_key(settings: Settings) -> tuple[int, str]:
     request_id = uuid4()
 
@@ -99,9 +99,7 @@ def verify_key(settings: Settings) -> tuple[int, str]:
         key = read_key(settings.key_file)
         if key is None:
             return 1, MESSAGES["unconfigured"]
-        reserved_day = reserve_request(conn, request_id)
-        if reserved_day is None:
-            return 1, "今日全服務模型額度已用完，將於臺灣時間午夜恢復。"
+        reserve_request(conn, request_id)
         binding = (key.version, key.fingerprint, PROVIDER, MODEL)
         sequence = conn.execute(
             """
@@ -127,9 +125,9 @@ def verify_key(settings: Settings) -> tuple[int, str]:
         except CredentialError:
             return None
 
-    # DNS 和 TLS 完成後，送出 HTTP 前再核對日界與 Key。
+    # DNS 和 TLS 完成後，送出 HTTP 前再核對 Key；用量仍歸入預留日期。
     def before_send() -> bool:
-        return current_key() == key and service_day_now() == reserved_day
+        return current_key() == key
 
     # 連線前已知設定變更就取消，避免未寫入的請求被連線故障誤列為送達不明。
     outcome = (
@@ -144,7 +142,11 @@ def verify_key(settings: Settings) -> tuple[int, str]:
         if current_key() != key:
             return 1, "驗證期間設定已變更。請確認目前設定後重新驗證。"
         if outcome.delivery == "unsent":
-            return 1, "模型請求未送出。請確認臺灣日期與設定後重新驗證。"
+            return 1, "模型請求未送出。請確認設定後重新驗證。"
+
+        # 供應商限流已送出且入帳，既有驗證狀態不受影響。
+        if outcome.status == "rate_limited":
+            return 1, "Gemini 限流（429）。請稍後重新驗證。"
         if outcome.status is not None:
             # 只比較已套用的明確結果；較新的暫時錯誤不會蓋掉較舊的明確無效。
             applied = conn.execute(

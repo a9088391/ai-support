@@ -55,8 +55,10 @@ TICKET_SUMMARY_FIELDS = (
 )
 
 
-# 用實際已回答的問題建單，分別核對可編輯描述與可信回答和來源。
+@pytest.mark.parametrize("sufficient", [True, False])
+# 有效相鄰文字也不能蓋過不足判定；手動工單保留終態及同一份搜尋快照。
 def test_ticket_snapshots_completed_answer(
+    sufficient: bool,
     answer_ready: Settings,
     monkeypatch: pytest.MonkeyPatch,
     provider_script: ProviderScript,
@@ -65,7 +67,10 @@ def test_ticket_snapshots_completed_answer(
     assert import_batch(monkeypatch, ORIGINAL) == 0
     answer = "一般配送需兩個工作天。"
     provider_script.responses.extend(
-        [interaction("requires_action", CALL), model_output(answer, [2])]
+        [
+            interaction("requires_action", CALL),
+            model_output(answer, [2], evidence_sufficient=sufficient),
+        ]
     )
 
     # 工單回應與後續明細都要包含相同的獨立證據。
@@ -92,9 +97,9 @@ def test_ticket_snapshots_completed_answer(
             "closed_at": None,
             "description": description,
             "question": QUESTION,
-            "answer_status": "answered",
-            "answer": answer,
-            "citations": [ORIGINAL_RESULTS["results"][1]],
+            "answer_status": "answered" if sufficient else "insufficient_evidence",
+            "answer": answer if sufficient else None,
+            "citations": [ORIGINAL_RESULTS["results"][1]] if sufficient else [],
             "search_results": ORIGINAL_RESULTS["results"],
         }
         assert browser.get(f"{TICKETS}/{ticket['id']}").json() == ticket
@@ -647,14 +652,14 @@ def test_ticket_concurrent_replays_keep_first_description(
         ]
 
 
-# 已失敗問答的真實來源在重試、改版和清理後仍維持原樣。
+# Gemini 限流後可手動建單，搜尋來源在重試、改版和清理後仍維持原樣。
 def test_ticket_failure_snapshot_survives_retry_update_and_purge(
     answer_ready: Settings,
     provider_script: ProviderScript,
     monkeypatch: pytest.MonkeyPatch,
     clock: list[datetime],
 ) -> None:
-    # 供應商的 503 私有內容不能成為公開證據；已完成的本地搜尋必須保留。
+    # 供應商的 429 私有內容不能成為公開證據；已完成的本地搜尋必須保留。
     assert import_batch(monkeypatch, ORIGINAL) == 0
     waiting, release = Event(), Event()
 
@@ -667,7 +672,7 @@ def test_ticket_failure_snapshot_survives_retry_update_and_purge(
     provider_script.responses.extend(
         [
             interaction("requires_action", CALL),
-            httpx.Response(503, json={"error": {"message": "private-marker"}}),
+            httpx.Response(429, json={"error": {"message": "private-marker"}}),
             model_output(None, []),
             pending,
             model_output(None, []),
@@ -678,12 +683,15 @@ def test_ticket_failure_snapshot_survives_retry_update_and_purge(
     with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
         login(browser)
         failed = ask(browser)
+        assert failed.status_code == 200
+        assert len(provider_script.requests) == 2
+        assert browser.get(TICKETS).json()["tickets"] == []
         form = ticket_form(failed, "問題未解決")
         created = browser.post(TICKETS, headers=CSRF, json=form)
         assert created.status_code == 200
         ticket = created.json()
         assert "private-marker" not in failed.text + created.text
-        assert ticket["answer_status"] == failed.json()["status"] == "unavailable"
+        assert ticket["answer_status"] == failed.json()["status"] == "rate_limited"
         assert ticket["answer"] is None and ticket["citations"] == []
         assert ticket["search_results"] == ORIGINAL_RESULTS["results"]
 
@@ -772,14 +780,17 @@ def test_ticket_failure_snapshot_survives_retry_update_and_purge(
 def test_ticket_pages_have_stable_membership_and_strict_limits(
     answer_ready: Settings, provider_script: ProviderScript, clock: list[datetime]
 ) -> None:
-    # 依正常配額只替前 20 次外呼提供結果，其後問答仍可建單。
-    provider_script.responses.extend([model_output(None, []) for _ in range(20)])
+    # 每題都提供明確的供應商回覆，分頁測試不依賴本機用量門檻。
+    provider_script.responses.extend(model_output(None, []) for _ in range(101))
     with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
         login(browser)
         expected = []
         for index in range(101):
+            answer = ask(browser)
+            assert answer.status_code == 200
+            assert answer.json()["status"] == "insufficient_evidence"
             response = browser.post(
-                TICKETS, headers=CSRF, json=ticket_form(ask(browser), f"描述 {index}")
+                TICKETS, headers=CSRF, json=ticket_form(answer, f"描述 {index}")
             )
             assert response.status_code == 200
             ticket = response.json()
@@ -802,6 +813,7 @@ def test_ticket_pages_have_stable_membership_and_strict_limits(
             "tickets": [],
             "has_more": False,
         }
+        assert len(provider_script.requests) == 101
         for query in (
             "limit=0",
             "limit=101",
@@ -909,7 +921,7 @@ def test_ticket_preserves_tool_evidence_when_worker_expires_before_delivery(
     # 不讓事件迴圈看見回傳值，驗證最終證據必須來自資料庫。
     def expires(
         settings: Settings, digest: bytes, attempt: Attempt, query: str, deadline: float
-    ) -> list[knowledge.SearchResult]:
+    ) -> list[knowledge.SearchEvidence]:
         assert search_attempt(settings, digest, attempt, query, deadline)
         raise AttemptDeadline
 

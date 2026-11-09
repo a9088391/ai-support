@@ -31,7 +31,11 @@ from backend.app import create_app
 from backend.credentials import set_key
 from backend.database import Settings, initialize, reserve_request
 from backend.tests.conftest import TEST_DSN
-from backend.tests.test_activation import success
+from backend.tests.test_activation import (
+    assert_previous_day_reservation,
+    reserve_before_taipei_midnight,
+    success,
+)
 from backend.tests.test_knowledge import (
     ORIGINAL,
     ORIGINAL_RESULTS,
@@ -49,10 +53,12 @@ from backend.tests.test_sessions import (
 )
 from backend.tests.test_sessions import clock as clock
 from fastapi.testclient import TestClient
+from google.genai._gaos.types.interactions import ModelOutputStep
 from httpcore._backends.auto import AutoBackend
 from psycopg import Connection, Cursor
 from psycopg.abc import Params
 from psycopg.sql import SQL, Composed
+from psycopg.types.json import Jsonb
 from starlette.types import Message, Scope
 
 ANSWERS = "/api/answers"
@@ -166,7 +172,9 @@ def provider_script(monkeypatch: pytest.MonkeyPatch) -> ProviderScript:
 
 
 # 生成一個完整文字輸出，讓本地驗證決定可否交付。
-def model_output(answer: str | None, citations: list[int]) -> httpx.Response:
+def model_output(
+    answer: str | None, citations: list[int], *, evidence_sufficient: bool | None = None
+) -> httpx.Response:
     return interaction(
         "completed",
         {
@@ -175,7 +183,16 @@ def model_output(answer: str | None, citations: list[int]) -> httpx.Response:
                 {
                     "type": "text",
                     "text": json.dumps(
-                        {"answer": answer, "citations": citations}, ensure_ascii=False
+                        {
+                            "evidence_sufficient": (
+                                answer is not None
+                                if evidence_sufficient is None
+                                else evidence_sufficient
+                            ),
+                            "answer": answer,
+                            "citations": citations,
+                        },
+                        ensure_ascii=False,
                     ),
                 }
             ],
@@ -247,8 +264,68 @@ def test_answer_grounds_citations_in_a_real_tool_result(
     assert "一般配送需兩個工作天。" in str(continuation[3]["result"])
 
 
-# 追問攜帶完整可信前文，但沒有本次工具結果就不能引用上一題的證據。
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            '{"evidence_sufficient":false,"answer":"相鄰資訊。","citations":[2]}',
+            "insufficient_evidence",
+        ),
+        ('{"answer":"相鄰資訊。","citations":[2]}', "invalid_output"),
+        *[
+            (
+                f'{{"evidence_sufficient":{flag},"answer":"相鄰資訊。","citations":[2]}}',
+                "invalid_output",
+            )
+            for flag in ('"false"', '"true"', "0", "1", "null", "[]", "{}")
+        ],
+        ('{"evidence_sufficient":false,"answer":null,"citations":[]', "invalid_output"),
+        ('{"evidence_sufficient":true,"answer":null,"citations":[]}', "invalid_output"),
+        (
+            '{"evidence_sufficient":true,"answer":"  ","citations":[2]}',
+            "invalid_output",
+        ),
+        ('{"evidence_sufficient":false,"answer":42,"citations":[2]}', "invalid_output"),
+    ],
+)
+# 不足判定優先於有效相鄰引用；缺欄、非布林或無效結構一律拒絕且保留搜尋。
+def test_answer_requires_strict_evidence_decision(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+    text: str,
+    expected: str,
+) -> None:
+    # 使用實際文件搜尋，避免空證據掩蓋判定欄位的錯誤。
+    assert import_batch(monkeypatch, ORIGINAL) == 0
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", CALL),
+            interaction(
+                "completed",
+                {"type": "model_output", "content": [{"type": "text", "text": text}]},
+            ),
+        ]
+    )
+
+    # 終態與持久化讀回皆清空可交付答案，但保留同一批證據與原有請求數。
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        response = ask(browser)
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == expected
+        assert payload["answer"] is None and payload["citations"] == []
+        assert payload["search_results"] == ORIGINAL_RESULTS["results"]
+        readback = browser.get(f"{ANSWERS}/{payload['attempt_id']}")
+        assert readback.status_code == 200 and readback.json() == payload
+        assert len(provider_script.requests) == 2
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+# 追問原樣重播新舊格式的可信前文，但不能引用上一題的證據。
 def test_follow_up_replays_exact_provider_steps_without_reusing_evidence(
+    legacy: bool,
     answer_ready: Settings,
     monkeypatch: pytest.MonkeyPatch,
     provider_script: ProviderScript,
@@ -269,6 +346,20 @@ def test_follow_up_replays_exact_provider_steps_without_reusing_evidence(
         login(browser)
         first = ask(browser).json()
         assert first["status"] == "answered"
+
+        # 舊版保存的文字不含新欄位；只替換歷史快照，追問必須逐字帶回。
+        if legacy:
+            final_step["content"][0]["text"] = json.dumps(
+                {"answer": "一般配送需兩個工作天。", "citations": [2]},
+                ensure_ascii=False,
+            )
+            with answer_ready.connect() as conn:
+                conn.execute(
+                    "UPDATE answer_attempts SET model_steps = "
+                    "jsonb_set(model_steps, ARRAY[(jsonb_array_length(model_steps) - 1)::text], %s) "
+                    "WHERE id = %s",
+                    (Jsonb(final_step), first["attempt_id"]),
+                )
         response = browser.post(
             ANSWERS,
             headers=CSRF,
@@ -1057,9 +1148,9 @@ def test_answer_retains_timely_search_when_worker_returns_after_deadline(
         attempt: Attempt,
         query: str,
         deadline: float,
-    ) -> list[knowledge.SearchResult]:
+    ) -> list[knowledge.SearchEvidence]:
         results = search_attempt(settings, digest, attempt, query, deadline)
-        assert [source.model_dump() for source in results] == ORIGINAL_RESULTS[
+        assert [source.source.model_dump() for source in results] == ORIGINAL_RESULTS[
             "results"
         ]
         assert monotonic() < deadline
@@ -1236,22 +1327,22 @@ def test_answer_partial_write_keeps_unknown_reservation(
         assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (2,)
 
 
-# 同一帳號同時搶最後一筆用量，跨重啟仍受限，另一帳號仍有獨立額度。
-def test_answer_account_quota_is_atomic_and_persistent(
+# 同一帳號可併發越過舊個人上限，兩個帳號在重啟後都可繼續外呼。
+def test_answer_account_usage_is_atomic_and_persistent(
     answer_ready: Settings,
     provider_script: ProviderScript,
 ) -> None:
     barrier = Barrier(2, timeout=5)
-    provider_script.responses.extend([model_output(None, []), model_output(None, [])])
+    provider_script.responses.extend(model_output(None, []) for _ in range(4))
     with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
         cookie = login(browser)
 
-        # 用實際 PostgreSQL 預留入口建立接近個人上限的初始狀態。
+        # 用實際 PostgreSQL 預留入口建立接近舊個人上限的初始狀態。
         with answer_ready.connect() as conn:
             for _ in range(19):
                 assert reserve_request(conn, uuid4(), username="user")
 
-        # 兩個 HTTP 請求使用同一帳號，啟動順序不影響原子上限。
+        # 兩個 HTTP 請求使用同一帳號，兩筆皆須外呼並入帳。
         def compete() -> str:
             barrier.wait()
             result = ask(browser)
@@ -1263,20 +1354,31 @@ def test_answer_account_quota_is_atomic_and_persistent(
             second = pool.submit(compete)
             assert sorted((first.result(timeout=8), second.result(timeout=8))) == [
                 "insufficient_evidence",
-                "rate_limited",
+                "insufficient_evidence",
             ]
+    # 重啟保留兩筆入帳結果，同帳號及另一帳號仍可繼續。
     with TestClient(create_app(answer_ready), base_url=ORIGIN) as restarted:
-        denied = restarted.post(
+        accepted = restarted.post(
             ANSWERS,
             headers={**CSRF, **replay_cookie(cookie)},
             json={"question": QUESTION},
         )
-        assert denied.json()["status"] == "rate_limited"
+        assert accepted.status_code == 200
+        assert accepted.json()["status"] == "insufficient_evidence"
         login(restarted, SUPPORT_FORM)
         assert ask(restarted).json()["status"] == "insufficient_evidence"
-    assert len(provider_script.requests) == 2
+    assert len(provider_script.requests) == 4
     with answer_ready.connect() as conn:
-        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (22,)
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (24,)
+        assert conn.execute(
+            """SELECT username, delivery, count(*) FROM model_requests
+               GROUP BY username, delivery ORDER BY username NULLS FIRST, delivery"""
+        ).fetchall() == [
+            (None, "sent", 1),
+            ("support", "sent", 1),
+            ("user", "sent", 3),
+            ("user", "unknown", 19),
+        ]
 
 
 # 子程序執行真實 CLI；只沿用已通過識別檢查的測試庫及受控外部回覆。
@@ -1305,13 +1407,13 @@ def verify_in_process(settings: Settings, result_pipe: ProcessPipe) -> None:
         result_pipe.send((cli.main(["verify-key"]), sent))
 
 
-# 真正的 CLI 子程序和 HTTP 服務各自在 PostgreSQL 等最後一筆用量；重啟沿用同一份額度。
-def test_cli_and_answer_share_last_service_quota(
+# CLI 子程序和 HTTP 服務共用帳本，競爭越過舊服務上限後仍可重啟續用。
+def test_cli_and_answer_share_service_usage(
     answer_ready: Settings,
     provider_script: ProviderScript,
 ) -> None:
     connecting, release = Event(), Event()
-    provider_script.responses.append(model_output(None, []))
+    provider_script.responses.extend(model_output(None, []) for _ in range(2))
 
     # 問答先完成初始 Session 檢查，讓兩個程序都能實際等在額度鎖。
     async def connect() -> None:
@@ -1374,30 +1476,38 @@ def test_cli_and_answer_share_last_service_quota(
                     release.set()
                     blocker.commit()
 
-                # 兩個程序搶剩餘用量，只有一邊可實際送出 HTTP。
+                # 兩個程序都實際送出 HTTP；同日加總必須保留兩筆。
                 response = pending.result(timeout=8)
                 assert response.status_code == 200
                 assert cli_reply.poll(8)
                 cli_status, cli_sent = cli_reply.recv()
-                assert (cli_status, response.json()["status"]) in {
-                    (0, "rate_limited"),
-                    (1, "insufficient_evidence"),
-                }
-                assert len(provider_script.requests) + cli_sent == 1
+                assert (cli_status, response.json()["status"]) == (
+                    0,
+                    "insufficient_evidence",
+                )
+                assert len(provider_script.requests) == cli_sent == 1
 
-    # 啟動新的 CLI 程序與 HTTP 應用，兩邊都不能重設或再次消耗已用完的額度。
+    # 新 CLI 程序與 HTTP 應用皆沿用原有明細及加總，只有手動請求新增用量。
     with cli_worker() as restarted_reply:
         assert restarted_reply.poll(8)
-        assert restarted_reply.recv() == (1, 0)
+        assert restarted_reply.recv() == (0, 1)
     with TestClient(create_app(answer_ready), base_url=ORIGIN) as restarted:
-        denied = restarted.post(
+        accepted = restarted.post(
             ANSWERS,
             headers={**CSRF, **replay_cookie(cookie)},
             json={"question": QUESTION},
         )
-        assert denied.status_code == 200 and denied.json()["status"] == "rate_limited"
+        assert (
+            accepted.status_code == 200
+            and accepted.json()["status"] == "insufficient_evidence"
+        )
+    assert len(provider_script.requests) == 2
     with answer_ready.connect() as conn:
-        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (100,)
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (103,)
+        assert conn.execute(
+            """SELECT username, delivery, count(*) FROM model_requests
+               GROUP BY username, delivery ORDER BY username NULLS FIRST"""
+        ).fetchall() == [(None, "sent", 3), ("user", "sent", 2)]
 
 
 @pytest.mark.parametrize("maximum", [False, True])
@@ -1488,17 +1598,17 @@ def test_answer_does_not_start_knowledge_query_after_tool_lock_deadline(
     def transaction_time() -> float:
         return tool_clock[0]
 
-    original = knowledge.find_fragments
+    original = knowledge.find_evidence
 
     # 保留真實 SQL 與來源，以便測出即使結果遭捨棄也已發動的越期查詢。
     def observe(
         conn: Connection[tuple[object, ...]], query: str
-    ) -> list[knowledge.SearchResult]:
+    ) -> list[knowledge.SearchEvidence]:
         queries.append(query)
         return original(conn, query)
 
     monkeypatch.setattr("backend.answer_storage.monotonic", transaction_time)
-    monkeypatch.setattr(knowledge, "find_fragments", observe)
+    monkeypatch.setattr(knowledge, "find_evidence", observe)
 
     # 等第一個模型請求完全寫入，再由測試取得工具授權會等待的啟用列鎖。
     async def pending() -> httpx.Response:
@@ -1730,51 +1840,86 @@ def test_answer_tool_limit_is_independent_of_model_request_limit(
     assert len(provider_script.requests) == 2
 
 
-@pytest.mark.parametrize("change", ["day", "key"])
-# 在最後授權取得後、實際寫入 HTTP 前變更日期或 Key；舊預留只能退回。
-def test_answer_rechecks_key_and_day_at_wire_admission(
+# 問答已跨臺灣日界仍送出，且帳本只增加原預留日用量。
+def test_answer_keeps_reservation_day_across_taipei_midnight(
     answer_ready: Settings,
     monkeypatch: pytest.MonkeyPatch,
     provider_script: ProviderScript,
-    change: str,
 ) -> None:
+    # 保留啟用探測的現有用量，確定問答只新增上一個臺灣日的預留。
+    with answer_ready.connect() as conn:
+        initial_usage = dict(
+            cast(
+                list[tuple[date, int]],
+                conn.execute(
+                    "SELECT service_day, used FROM daily_model_quota"
+                ).fetchall(),
+            )
+        )
+    reserved_days: list[date] = []
+
+    # 在 SDK 第一次寫入時，核對已提交的預留日與資料庫當日不同。
+    async def before_write() -> None:
+        day = await anyio.to_thread.run_sync(
+            assert_previous_day_reservation, answer_ready, "user"
+        )
+        reserved_days.append(day)
+        provider_script.before_write = None
+
+    # 只控制預留時間和網路回覆，維持 HTTP 與 SDK 的實際寫入路徑。
+    monkeypatch.setattr(answers, "reserve_request", reserve_before_taipei_midnight)
+    provider_script.before_write = before_write
+    provider_script.responses.append(model_output(None, []))
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        response = ask(browser)
+        assert response.status_code == 200
+        assert response.json()["status"] == "insufficient_evidence"
+        assert browser.get("/api/setup").json()["status"] == "ready"
+
+    # 問答實際送出一次，且當日沒有多出用量。
+    assert len(provider_script.requests) == 1
+    (original_day,) = reserved_days
+    initial_usage[original_day] = initial_usage.get(original_day, 0) + 1
+    with answer_ready.connect() as conn:
+        assert conn.execute(
+            "SELECT service_day, delivery FROM model_requests WHERE username = 'user'"
+        ).fetchall() == [(original_day, "sent")]
+        assert set(
+            conn.execute("SELECT service_day, used FROM daily_model_quota")
+        ) == set(initial_usage.items())
+
+
+# 在最後授權取得後換 Key，確認請求不寫入 HTTP 且退回原預留。
+def test_answer_rechecks_key_at_wire_admission(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+) -> None:
+    # 先讀取現有啟用探測用量，後續未送出的預留必須退回。
     with answer_ready.connect() as conn:
         row = conn.execute("SELECT service_day FROM daily_model_quota").fetchone()
         assert row is not None
         original_day = cast(date, row[0])
-    current_day = [original_day]
-    original = lock_dispatch
 
-    # 首次預留仍使用 PostgreSQL 真實日期，最後檢查才會看到日界變化。
-    def wire_day() -> date:
-        return current_day[0]
-
-    # 真正取得 Session/啟用列鎖後，在最後非同步等待前替換檔案或跨日。
+    # 真正取得 Session 與啟用列鎖後，在最後非同步等待前替換檔案。
     def after_lock(
         settings: Settings, digest: bytes, attempt: Attempt, *args: float
     ) -> Dispatch:
-        result = original(settings, digest, attempt, *args)
-        if change == "key":
-            set_key(settings.key_file, "fixture-rotated-before-wire")
-        else:
-            current_day[0] += timedelta(days=1)
+        result = lock_dispatch(settings, digest, attempt, *args)
+        set_key(settings.key_file, "fixture-rotated-before-wire")
         return result
 
-    monkeypatch.setattr(answers, "service_day_now", wire_day, raising=False)
+    # 拒絕本次請求，且公開啟用狀態反映新 Key 尚未驗證。
     monkeypatch.setattr(answers, "lock_dispatch", after_lock)
     provider_script.responses.append(model_output(None, []))
     with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
         login(browser)
         response = ask(browser)
-        if change == "key":
-            assert response.status_code == 503
-            assert browser.get("/api/setup").json()["status"] == "unverified"
-        else:
-            assert response.status_code == 200
-            assert response.json()["status"] == "rate_limited"
-            assert browser.get("/api/setup").json()["status"] == "ready"
+        assert response.status_code == 503
+        assert browser.get("/api/setup").json()["status"] == "unverified"
 
-    # 明確未送出的舊日期請求只退原預留，完全沒有任何業務 HTTP 寫入。
+    # 記錄原預留為未送出，保留啟用探測的既有用量。
     assert provider_script.requests == []
     with answer_ready.connect() as conn:
         assert conn.execute(
@@ -2300,3 +2445,728 @@ def test_admitted_socket_write_finishes_before_rejection_without_holding_respons
             "SELECT delivery FROM model_requests WHERE username IS NOT NULL"
         ).fetchall() == [("sent",), ("sent",)]
         assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (3,)
+
+
+# 使用最小權限批次覆蓋 HTTP 與資料庫邊界；正式預載文件另由隔離驗收核對。
+def permission_batch() -> dict[str, object]:
+    return {
+        "documents": [
+            {
+                "id": "workspace-access",
+                "title": "星港工作台：工作區權限",
+                "version": "v2",
+                "fragments": [
+                    {
+                        "id": "viewer",
+                        "text": "檢視者可閱讀共享報表，無法修改工作區設定。需要編輯時，請向工作區擁有者申請。",
+                        "permissions": [
+                            {
+                                "role": "viewer",
+                                "action": "read",
+                                "resource": "shared_reports",
+                                "effect": "allow",
+                            },
+                            {
+                                "role": "viewer",
+                                "action": "modify",
+                                "resource": "workspace_settings",
+                                "effect": "deny",
+                            },
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("檢視者能匯出共享報表嗎？", "insufficient_evidence"),
+        ("工作區檢視者是否可以匯出共享報表？", "insufficient_evidence"),
+        ("檢視者可不可以匯出共享報表?", "insufficient_evidence"),
+        ("檢視者能閱讀共享報表嗎？", "answered"),
+        ("我是工作區檢視者，可以閱讀共享報表嗎？", "answered"),
+        ("檢視者能修改工作區設定嗎？", "answered"),
+        ("編輯者能閱讀共享報表嗎？", "insufficient_evidence"),
+        ("檢視者能閱讀工作區設定嗎？", "insufficient_evidence"),
+        (
+            "工作區檢視者能閱讀共享報表嗎？如果需要編輯設定，要找誰？",
+            "insufficient_evidence",
+        ),
+        ("那我可以直接修改設定嗎？需要編輯時要找誰？", "answered"),
+    ],
+)
+# 模型宣稱充分仍須有本題權限事實；舊版複合題缺申請事實，前文追問保留既有流程。
+def test_permission_answer_requires_matching_cited_fact(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+    question: str,
+    expected: str,
+) -> None:
+    # 工具查詢刻意只找角色；權限判定不得取自模型的搜尋參數。
+    assert import_batch(monkeypatch, permission_batch()) == 0
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", {**CALL, "arguments": {"query": "檢視者"}}),
+            model_output("檢視者可閱讀共享報表，無法修改工作區設定。", [1]),
+        ]
+    )
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        response = ask(browser, question)
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == expected
+        assert len(payload["search_results"]) == 1
+        assert payload["search_results"][0]["version"] == "v2"
+        if expected == "insufficient_evidence":
+            assert payload["answer"] is None and payload["citations"] == []
+        else:
+            assert payload["answer"] == "檢視者可閱讀共享報表，無法修改工作區設定。"
+            assert payload["citations"] == payload["search_results"]
+        assert browser.get(f"{ANSWERS}/{payload['attempt_id']}").json() == payload
+
+        # 手動建單及明細保留同一終態，所有公開證據僅含既有五欄。
+        created = browser.post(
+            "/api/tickets",
+            headers=CSRF,
+            json={
+                "question_id": payload["question_id"],
+                "attempt_id": payload["attempt_id"],
+                "description": "權限確認",
+            },
+        )
+        assert created.status_code == 200
+        ticket = created.json()
+        assert ticket["answer_status"] == expected
+        for field in ("answer", "citations", "search_results"):
+            assert ticket[field] == payload[field]
+        assert browser.get(f"/api/tickets/{ticket['id']}").json() == ticket
+        public_search = browser.post(
+            "/api/knowledge/search", headers=CSRF, json={"query": "檢視者"}
+        )
+        assert public_search.json()["results"] == payload["search_results"]
+        assert "permissions" not in response.text + created.text + public_search.text
+
+    # 檢查實際 SDK 傳輸及資料庫快照，內部 metadata 不得成為公開或模型資料。
+    assert len(provider_script.requests) == 2
+    assert all(b"permissions" not in request for request in provider_script.requests)
+    with answer_ready.connect() as conn:
+        row = conn.execute(
+            "SELECT citations, search_results, model_steps FROM answer_attempts"
+        ).fetchone()
+        assert row is not None and "permissions" not in json.dumps(row)
+        row = conn.execute("SELECT citations, search_results FROM tickets").fetchone()
+        assert row is not None and "permissions" not in json.dumps(row)
+
+
+@pytest.mark.parametrize("documented_before", [False, True])
+# 搜尋後即使知識改版，判定仍綁定當輪讀到的來源與 metadata，不能重新查最新資料。
+def test_permission_evidence_uses_search_snapshot(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+    documented_before: bool,
+) -> None:
+    # 相同文字和片段在兩版只有權限事實不同，能分辨是否偷讀了最新文件。
+    fact = {
+        "role": "viewer",
+        "action": "export",
+        "resource": "shared_reports",
+        "effect": "deny",
+    }
+    original = {
+        "documents": [
+            {
+                "id": "fixture",
+                "title": "檢視者",
+                "version": "v1",
+                "fragments": [
+                    {
+                        "id": "viewer",
+                        "text": "權限說明。",
+                        "permissions": [fact] if documented_before else [],
+                    }
+                ],
+            }
+        ]
+    }
+    updated = {
+        "documents": [
+            {
+                "id": "fixture",
+                "title": "檢視者",
+                "version": "v2",
+                "fragments": [
+                    {
+                        "id": "viewer",
+                        "text": "權限說明。",
+                        "permissions": [] if documented_before else [fact],
+                    }
+                ],
+            }
+        ]
+    }
+    assert import_batch(monkeypatch, original) == 0
+
+    # 供應商收到工具結果才改版，避免以測試直接注入證據代替真實查詢。
+    async def replace_after_search() -> httpx.Response:
+        assert import_batch(monkeypatch, updated) == 0
+        return model_output("權限回答。", [1])
+
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", {**CALL, "arguments": {"query": "檢視者"}}),
+            replace_after_search,
+        ]
+    )
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        payload = ask(browser, "檢視者能匯出共享報表嗎？").json()
+        assert payload["status"] == (
+            "answered" if documented_before else "insufficient_evidence"
+        )
+        assert payload["search_results"][0]["version"] == "v1"
+        assert browser.get(f"{ANSWERS}/{payload['attempt_id']}").json() == payload
+
+
+@pytest.mark.parametrize("citations", [[1], [2], [3], [2, 2]])
+# 找到權限片段不代表已引用；無關引用與無效引用須分別沿用不足和格式錯誤終態。
+def test_permission_fact_must_belong_to_cited_evidence(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+    citations: list[int],
+) -> None:
+    # 搜尋標題同時取得無關片段與具有明示權限的片段。
+    batch = {
+        "documents": [
+            {
+                "id": "fixture",
+                "title": "權限",
+                "version": "v1",
+                "fragments": [
+                    {"id": "a", "text": "相鄰資訊。"},
+                    {
+                        "id": "b",
+                        "text": "檢視者可閱讀共享報表。",
+                        "permissions": [
+                            {
+                                "role": "viewer",
+                                "action": "read",
+                                "resource": "shared_reports",
+                                "effect": "allow",
+                            }
+                        ],
+                    },
+                ],
+            }
+        ]
+    }
+    assert import_batch(monkeypatch, batch) == 0
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", {**CALL, "arguments": {"query": "權限"}}),
+            model_output("檢視者可閱讀共享報表。", citations),
+        ]
+    )
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        payload = ask(browser, "檢視者能閱讀共享報表嗎？").json()
+        expected = (
+            "insufficient_evidence"
+            if citations == [1]
+            else "answered"
+            if citations == [2]
+            else "invalid_output"
+        )
+        assert payload["status"] == expected
+        assert len(payload["search_results"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("version", "citation", "expected"),
+    [
+        ("v1", 1, "insufficient_evidence"),
+        ("v2", 1, "insufficient_evidence"),
+        ("v2", 2, "answered"),
+    ],
+)
+# 同一公開來源重查沿用首次事實；不同版本則必須引用真正含事實的那筆快照。
+def test_permission_repeated_search_keeps_source_binding(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+    version: str,
+    citation: int,
+    expected: str,
+) -> None:
+    # 第一輪無權限記載；第二輪僅 metadata 或版本變動，文字保持一致。
+    original = {
+        "documents": [
+            {
+                "id": "fixture",
+                "title": "權限",
+                "version": "v1",
+                "fragments": [{"id": "viewer", "text": "權限說明。"}],
+            }
+        ]
+    }
+    updated = {
+        "documents": [
+            {
+                "id": "fixture",
+                "title": "權限",
+                "version": version,
+                "fragments": [
+                    {
+                        "id": "viewer",
+                        "text": "權限說明。",
+                        "permissions": [
+                            {
+                                "role": "viewer",
+                                "action": "export",
+                                "resource": "shared_reports",
+                                "effect": "allow",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    assert import_batch(monkeypatch, original) == 0
+    call = {**CALL, "arguments": {"query": "權限"}}
+
+    # 等第一次工具快照已送達才替換，第二次工具依相同授權路徑重新搜尋。
+    async def replace_and_search() -> httpx.Response:
+        assert import_batch(monkeypatch, updated) == 0
+        return interaction("requires_action", {**call, "id": "second-search"})
+
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", call),
+            replace_and_search,
+            model_output("權限回答。", [citation]),
+        ]
+    )
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        payload = ask(browser, "檢視者能匯出共享報表嗎？").json()
+        assert payload["status"] == expected
+        assert len(payload["search_results"]) == (1 if version == "v1" else 2)
+        if expected == "answered":
+            assert payload["citations"][0]["version"] == "v2"
+
+    # 相同來源即使 metadata 改變，也不能在工具結果偷偷產生新 evidence_id。
+    request = json.loads(provider_script.requests[-1].split(b"\r\n\r\n", 1)[1])
+    results = [step for step in request["input"] if step["type"] == "function_result"]
+    identifiers = [
+        json.loads(step["result"][0]["text"])[0]["evidence_id"] for step in results
+    ]
+    assert identifiers == ([1, 1] if version == "v1" else [1, 2])
+
+
+COMPOUND_QUESTION = "工作區檢視者能閱讀共享報表嗎？如果需要編輯設定，要找誰？"
+COMPOUND_ANSWER = (
+    "檢視者可閱讀共享報表，無法修改工作區設定。需要編輯時，請向工作區擁有者申請。"
+)
+
+
+# 從既有 v2 測試文件增加申請對象，保持可見片段與公開欄位不變。
+def compound_batch(case: str = "complete") -> knowledge.Batch:
+    batch = knowledge.Batch.model_validate(permission_batch())
+    batch.documents[0].version = "v3"
+    permissions = batch.documents[0].fragments[0].permissions
+    assert permissions is not None
+    permissions[1].application_recipient = knowledge.ApplicationRecipient(
+        role="owner", label="工作區擁有者"
+    )
+    # 只改測試批次，將矛盾文字、漏列與同版分段送進同一個產品驗證入口。
+    fragment = batch.documents[0].fragments[0]
+    if case == "padded_excerpt":
+        fragment.text = f" \n{fragment.text}\n "
+    elif case == "recipient_missing":
+        permissions[1].application_recipient = None
+    elif case == "read_text_missing":
+        fragment.text = "檢視者無法修改工作區設定。需要編輯時，請向工作區擁有者申請。"
+    elif case == "modify_text_conflict":
+        fragment.text = fragment.text.replace("無法修改", "可修改")
+    elif case == "recipient_text_missing":
+        fragment.text = "檢視者可閱讀共享報表，無法修改工作區設定。"
+    elif case == "recipient_text_conflict":
+        fragment.text = fragment.text.replace("請向工作區擁有者申請", "請向編輯者申請")
+    elif case == "additional_contradiction":
+        fragment.text += "檢視者也可修改工作區設定。"
+    elif case in {"split_duplicate_deny", "unbound_application"}:
+        fragment.text = "檢視者可閱讀共享報表。"
+        if case == "unbound_application":
+            fragment.text += "需要編輯時，請向工作區擁有者申請。"
+        fragment.permissions = [permissions[0]]
+        batch.documents[0].fragments.extend(
+            [
+                knowledge.Fragment(
+                    id="modify",
+                    text="檢視者無法修改工作區設定。",
+                    permissions=[
+                        permissions[1].model_copy(
+                            update={"application_recipient": None}
+                        )
+                    ],
+                ),
+                knowledge.Fragment(
+                    id="apply",
+                    text="檢視者無法修改工作區設定。需要編輯時，請向工作區擁有者申請。",
+                    permissions=[permissions[1]],
+                ),
+            ]
+        )
+    elif case == "unrelated_citation":
+        batch.documents[0].fragments.append(
+            knowledge.Fragment(id="other", text="其他帳務說明。")
+        )
+    return batch
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "read_text_missing",
+        "modify_text_conflict",
+        "recipient_text_missing",
+        "recipient_text_conflict",
+        "additional_contradiction",
+        "split_duplicate_deny",
+        "unbound_application",
+        "unrelated_citation",
+        "padded_excerpt",
+    ],
+)
+# 每個 metadata 都須由自己的可見片段明示支持；同版冗餘禁止不隱藏唯一申請對象。
+def test_compound_visible_proof(case: str) -> None:
+    document = compound_batch(case).documents[0]
+    evidence = [
+        knowledge.SearchEvidence(
+            knowledge.SearchResult(
+                document_id=document.id,
+                title=document.title,
+                version=document.version,
+                fragment_id=fragment.id,
+                excerpt=fragment.text,
+            ),
+            tuple(fragment.permissions or []),
+        )
+        for fragment in document.fragments
+    ]
+    assert answers.compound_permission_answer("viewer", evidence) == (
+        COMPOUND_ANSWER if case in {"split_duplicate_deny", "padded_excerpt"} else None
+    )
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        COMPOUND_QUESTION,
+        "我是工作區檢視者，可以查看共享報表嗎？若需要修改工作區設定，應該向誰申請？",
+        "檢視者能否檢視共享報表？需要編輯設定要找誰?",
+    ],
+)
+# 明示複合題由當輪事實補齊三項；模型漏答不影響證據完整時的確定性結果。
+def test_compound_resolution_completes_omitted_fact(question: str) -> None:
+    document = compound_batch().documents[0]
+    fragment = document.fragments[0]
+    source = knowledge.SearchResult(
+        document_id=document.id,
+        title=document.title,
+        version=document.version,
+        fragment_id=fragment.id,
+        excerpt=fragment.text,
+    )
+    evidence = [knowledge.SearchEvidence(source, tuple(fragment.permissions or []))]
+    output = ModelOutputStep.model_validate(
+        model_output("可以閱讀共享報表，需要編輯時找工作區擁有者。", [1]).json()[
+            "steps"
+        ][0]
+    )
+    response = answer_storage.AnswerResponse(
+        conversation_id=uuid4(),
+        question_id=uuid4(),
+        attempt_id=uuid4(),
+        status="invalid_output",
+        citations=[],
+        search_results=[source],
+    )
+    raw = output.model_dump()
+    answers.resolve_answer(output, evidence, response, question)
+    assert response.status == "answered"
+    assert response.answer == COMPOUND_ANSWER
+    assert response.citations == [source]
+    assert output.model_dump() == raw
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("read_missing", "insufficient_evidence"),
+        ("modify_missing", "insufficient_evidence"),
+        ("recipient_missing", "insufficient_evidence"),
+        ("read_conflict", "insufficient_evidence"),
+        ("modify_conflict", "insufficient_evidence"),
+        ("recipient_role_conflict", "insufficient_evidence"),
+        ("recipient_label_conflict", "insufficient_evidence"),
+        ("version_mixed", "insufficient_evidence"),
+        ("uncited", "insufficient_evidence"),
+        ("invalid_citation", "invalid_output"),
+        ("duplicate_citation", "invalid_output"),
+        ("model_insufficient", "insufficient_evidence"),
+        ("null_answer", "invalid_output"),
+        ("read_denied", "insufficient_evidence"),
+    ],
+)
+# 缺項、矛盾或跨版拼接不能被確定性組裝掩蓋；先保留原有模型與引用閘門。
+def test_compound_resolution_requires_complete_bound_evidence(
+    case: str, expected: str
+) -> None:
+    document = compound_batch().documents[0]
+    fragment = document.fragments[0]
+    permissions = fragment.permissions
+    assert permissions is not None
+    source = knowledge.SearchResult(
+        document_id=document.id,
+        title=document.title,
+        version=document.version,
+        fragment_id=fragment.id,
+        excerpt=fragment.text,
+    )
+    other = source.model_copy(update={"fragment_id": "other"})
+    evidence = [knowledge.SearchEvidence(source, tuple(permissions))]
+    citations = [1]
+    if case == "read_missing":
+        evidence[0] = knowledge.SearchEvidence(source, (permissions[1],))
+    elif case == "modify_missing":
+        evidence[0] = knowledge.SearchEvidence(source, (permissions[0],))
+    elif case == "recipient_missing":
+        permissions[1].application_recipient = None
+    elif case in {"read_conflict", "modify_conflict"}:
+        fact = permissions[0 if case == "read_conflict" else 1].model_copy(deep=True)
+        fact.effect = "deny" if fact.effect == "allow" else "allow"
+        fact.application_recipient = None
+        evidence.append(knowledge.SearchEvidence(other, (fact,)))
+        citations.append(2)
+    elif case in {"recipient_role_conflict", "recipient_label_conflict"}:
+        fact = permissions[1].model_copy(deep=True)
+        assert fact.application_recipient is not None
+        if case == "recipient_role_conflict":
+            fact.application_recipient.role = "editor"
+        else:
+            fact.application_recipient.label = "管理員"
+        evidence.append(knowledge.SearchEvidence(other, (fact,)))
+        citations.append(2)
+    elif case == "version_mixed":
+        evidence[0] = knowledge.SearchEvidence(source, (permissions[0],))
+        evidence.append(
+            knowledge.SearchEvidence(
+                source.model_copy(update={"version": "v4"}), (permissions[1],)
+            )
+        )
+        citations.append(2)
+    elif case == "uncited":
+        evidence.append(knowledge.SearchEvidence(other, ()))
+        citations = [2]
+    elif case == "invalid_citation":
+        citations = [2]
+    elif case == "duplicate_citation":
+        citations = [1, 1]
+    elif case == "read_denied":
+        permissions[0].effect = "deny"
+
+    # 透過真正的最終輸出驗證入口，確認模型不足或無答案不會被補成成功。
+    output = ModelOutputStep.model_validate(
+        model_output(
+            None if case == "null_answer" else "模型遺漏或錯誤回答。",
+            citations,
+            evidence_sufficient=case != "model_insufficient",
+        ).json()["steps"][0]
+    )
+    response = answer_storage.AnswerResponse(
+        conversation_id=uuid4(),
+        question_id=uuid4(),
+        attempt_id=uuid4(),
+        status="invalid_output",
+        citations=[],
+        search_results=[item.source for item in evidence],
+    )
+    answers.resolve_answer(output, evidence, response, COMPOUND_QUESTION)
+    assert response.status == expected
+    assert response.answer is None and response.citations == []
+    assert response.search_results == [item.source for item in evidence]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "complete",
+        "padded_excerpt",
+        "recipient_missing",
+        "modify_text_conflict",
+        "recipient_text_missing",
+        "split_duplicate_deny",
+    ],
+)
+# HTTP 與手動建單保存相同終態；成功才保存原模型交換，不足仍清除前文。
+def test_compound_http_ticket_preserves_evidence_and_raw_output(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+    case: str,
+) -> None:
+    batch = compound_batch(case)
+    complete = case in {"complete", "split_duplicate_deny", "padded_excerpt"}
+    assert import_batch(monkeypatch, batch.model_dump(exclude_none=True)) == 0
+    raw = model_output(
+        "可以閱讀共享報表，請向擁有者申請編輯。",
+        list(range(1, len(batch.documents[0].fragments) + 1)),
+    )
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", {**CALL, "arguments": {"query": "檢視者"}}),
+            raw,
+        ]
+    )
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        payload = ask(browser, COMPOUND_QUESTION).json()
+        assert payload["status"] == (
+            "answered" if complete else "insufficient_evidence"
+        )
+        assert payload["answer"] == (COMPOUND_ANSWER if complete else None)
+        assert payload["citations"] == (payload["search_results"] if complete else [])
+        assert len(payload["search_results"]) == len(batch.documents[0].fragments)
+        assert payload["search_results"][0]["version"] == "v3"
+        assert {
+            source["fragment_id"]: source["excerpt"]
+            for source in payload["search_results"]
+        } == {fragment.id: fragment.text for fragment in batch.documents[0].fragments}
+        assert browser.get(f"{ANSWERS}/{payload['attempt_id']}").json() == payload
+        created = browser.post(
+            "/api/tickets",
+            headers=CSRF,
+            json={
+                "question_id": payload["question_id"],
+                "attempt_id": payload["attempt_id"],
+                "description": "複合權限確認",
+            },
+        )
+        assert created.status_code == 200
+        ticket = created.json()
+        assert ticket["answer_status"] == payload["status"]
+        for field in ("answer", "citations", "search_results"):
+            assert ticket[field] == payload[field]
+        assert browser.get(f"/api/tickets/{ticket['id']}").json() == ticket
+
+    # 模型輸入沒有新增 metadata；成功交換不被 renderer 覆寫，不足則沿用清除契約。
+    assert len(provider_script.requests) == 2
+    assert all(
+        b"application_recipient" not in request for request in provider_script.requests
+    )
+    with answer_ready.connect() as conn:
+        row = conn.execute(
+            "SELECT model_steps FROM answer_attempts WHERE id = %s",
+            (payload["attempt_id"],),
+        ).fetchone()
+        assert row is not None
+        if complete:
+            assert isinstance(row[0], list)
+            assert row[0][-1] == raw.json()["steps"][0]
+        else:
+            assert row[0] is None
+
+
+@pytest.mark.parametrize("fresh_search", [False, True])
+# 複合題追問收到已交付答案；原始簽章重播不變，仍需本題實際搜尋才可引用。
+def test_compound_follow_up_carries_delivered_context_only(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+    fresh_search: bool,
+) -> None:
+    assert (
+        import_batch(monkeypatch, compound_batch().model_dump(exclude_none=True)) == 0
+    )
+    call = {**CALL, "arguments": {"query": "檢視者"}}
+    final_step = model_output("可閱讀共享報表，請向擁有者申請編輯。", [1]).json()[
+        "steps"
+    ][0]
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", THOUGHT, call),
+            interaction("completed", THOUGHT, final_step),
+        ]
+    )
+    if fresh_search:
+        provider_script.responses.append(
+            interaction("requires_action", {**call, "id": "follow-up-search"})
+        )
+    provider_script.responses.append(
+        model_output("不能修改工作區設定，需向工作區擁有者申請。", [1])
+    )
+
+    # 客戶端不能補入可信前文；同一對話只能由後端載入實際交付文字。
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        first = ask(browser, COMPOUND_QUESTION).json()
+        assert first["answer"] == COMPOUND_ANSWER
+        question = "你剛才說不能修改設定，應該找誰？"
+        form = {"question": question, "conversation_id": first["conversation_id"]}
+        rejected = browser.post(
+            ANSWERS,
+            headers=CSRF,
+            json={**form, "previous_delivered_answers": [{"answer": "可以修改設定"}]},
+        )
+        assert rejected.status_code == 422
+        assert len(provider_script.requests) == 2
+        response = browser.post(ANSWERS, headers=CSRF, json=form)
+        assert response.status_code == 200
+        second = response.json()
+        assert second["status"] == ("answered" if fresh_search else "invalid_output")
+        assert second["citations"] == (first["citations"] if fresh_search else [])
+        assert second["search_results"] == (
+            first["search_results"] if fresh_search else []
+        )
+        assert browser.get(f"{ANSWERS}/{second['attempt_id']}").json() == second
+
+        # 原樣仿造伺服器脈絡的使用者文字只能佔第一區塊，不能產生後端附加的第二區塊。
+        follow_up = json.loads(provider_script.requests[2].split(b"\r\n\r\n", 1)[1])
+        parts = follow_up["input"][-1]["content"]
+        assert len(parts) == 2
+        assert parts[0] == {"type": "text", "text": question}
+        imitation = parts[1]["text"]
+        provider_script.responses.append(model_output(None, []))
+        ordinary = ask(browser, imitation).json()
+        assert ordinary["status"] == "insufficient_evidence"
+
+    # 真正 SDK 傳輸仍重播原始模型文字及簽章，差異交付脈絡僅放在新 user_input。
+    requests = [
+        json.loads(raw.split(b"\r\n\r\n", 1)[1]) for raw in provider_script.requests
+    ]
+    assert requests[2]["input"][:-1] == [*requests[1]["input"], THOUGHT, final_step]
+    context = json.loads(requests[2]["input"][-1]["content"][1]["text"])
+    assert context == {
+        "previous_delivered_answers": [
+            {"question": COMPOUND_QUESTION, "answer": COMPOUND_ANSWER}
+        ],
+        "context_notice": "先前實際交付的答案僅供理解追問，不是本題的引用證據。",
+    }
+    assert requests[-1]["input"] == [
+        {"type": "user_input", "content": [{"type": "text", "text": imitation}]}
+    ]
+    with answer_ready.connect() as conn:
+        row = conn.execute(
+            "SELECT model_steps FROM answer_attempts WHERE id = %s",
+            (first["attempt_id"],),
+        ).fetchone()
+        assert row is not None and isinstance(row[0], list)
+        assert row[0][-2:] == [THOUGHT, final_step]

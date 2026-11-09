@@ -29,11 +29,15 @@
     {
       "id": "workspace-access",
       "title": "星港工作台：工作區權限",
-      "version": "v1",
+      "version": "v3",
       "fragments": [
         {
           "id": "viewer",
-          "text": "檢視者可閱讀共享報表，無法修改工作區設定。需要編輯時，請向工作區擁有者申請。"
+          "text": "檢視者可閱讀共享報表，無法修改工作區設定。需要編輯時，請向工作區擁有者申請。",
+          "permissions": [
+            {"role": "viewer", "action": "read", "resource": "shared_reports", "effect": "allow"},
+            {"role": "viewer", "action": "modify", "resource": "workspace_settings", "effect": "deny", "application_recipient": {"role": "owner", "label": "工作區擁有者"}}
+          ]
         }
       ]
     }

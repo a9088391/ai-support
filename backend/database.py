@@ -3,7 +3,6 @@ from datetime import date, datetime
 from os import environ
 from pathlib import Path
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 import psycopg
 from psycopg import sql
@@ -18,7 +17,6 @@ from backend.credentials import (
 from backend.provider import Delivery
 
 SCHEMA = Path(__file__).with_name("schema.sql")
-TAIPEI = ZoneInfo("Asia/Taipei")
 
 
 @dataclass(frozen=True)
@@ -71,45 +69,35 @@ def initialize(settings: Settings) -> None:
         conn.execute(SCHEMA.read_text(encoding="utf-8"))
 
 
-# 寫入 HTTP 前用同一個臺灣日界線驗證已提交的預留。
-def service_day_now() -> date:
-    return datetime.now(TAIPEI).date()
-
-
-# 於外呼前一次原子保留臺灣日期的全服務額度，並新增預設送達不明的紀錄。
+# 於外呼前原子登記臺灣日期用量及預設送達不明的紀錄。
 def reserve_request(
     conn: psycopg.Connection[tuple[object, ...]],
     request_id: UUID,
     *,
     at: datetime | None = None,
     username: str | None = None,
-) -> date | None:
-    # CLI 和業務共用短交易鎖；等到取得鎖才取臺灣日期並比較個人用量。
+) -> date:
+    # 預留及取消共用短交易鎖；取鎖後以資料庫時間決定用量歸屬。
     conn.execute("SELECT pg_advisory_xact_lock(7680281636712970524)")
     cursor = conn.execute(
         """
-        WITH day AS (
-            SELECT (COALESCE(%s::timestamptz, clock_timestamp()) AT TIME ZONE 'Asia/Taipei')::date AS service_day
-        ), reservation AS (
+        WITH reservation AS (
             INSERT INTO daily_model_quota (service_day, used)
-            SELECT day.service_day, 1 FROM day
-            WHERE %s::text IS NULL OR (
-                SELECT count(*) FROM model_requests AS r
-                WHERE r.username = %s AND r.service_day = day.service_day
-                    AND r.delivery <> 'unsent'
-            ) < 20
+            VALUES ((COALESCE(%s::timestamptz, clock_timestamp()) AT TIME ZONE 'Asia/Taipei')::date, 1)
             ON CONFLICT (service_day) DO UPDATE SET used = daily_model_quota.used + 1
-            WHERE daily_model_quota.used < 100
             RETURNING service_day
         )
         INSERT INTO model_requests (id, service_day, username)
         SELECT %s, service_day, %s FROM reservation
         RETURNING service_day
         """,
-        (at, username, username, request_id, username),
+        (at, request_id, username),
     )
+    # 同一語句必須寫入明細；缺少結果時回滾交易，避免未入帳就外呼。
     row = cursor.fetchone()
-    return row[0] if row is not None and isinstance(row[0], date) else None
+    if row is None or not isinstance(row[0], date):
+        raise psycopg.DatabaseError("無法記錄模型請求用量。")
+    return row[0]
 
 
 # 一併記錄已送出與本機取消；送達不明沿用預留時的狀態及用量。

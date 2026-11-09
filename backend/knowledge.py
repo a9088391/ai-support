@@ -1,9 +1,10 @@
 import json
 import re
-from typing import Annotated
+from dataclasses import dataclass
+from typing import Annotated, Literal
 
 from psycopg import Connection
-from psycopg.rows import class_row
+from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
@@ -33,9 +34,30 @@ class KnowledgeInput(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", hide_input_in_errors=True)
 
 
+class ApplicationRecipient(KnowledgeInput):
+    role: Identifier
+    label: PlainText = Field(max_length=200)
+
+
+class Permission(KnowledgeInput):
+    role: Identifier
+    action: Identifier
+    resource: Identifier
+    effect: Literal["allow", "deny"]
+    application_recipient: ApplicationRecipient | None = None
+
+    @model_validator(mode="after")
+    # 申請對象只補充不能自行操作的事實，避免允許與申請限制互相矛盾。
+    def recipient_requires_denial(self) -> "Permission":
+        if self.application_recipient is not None and self.effect != "deny":
+            raise ValueError("只有禁止操作的權限事實可列申請對象。")
+        return self
+
+
 class Fragment(KnowledgeInput):
     id: Identifier
     text: PlainText = Field(max_length=4000)
+    permissions: list[Permission] | None = Field(default=None, max_length=100)
 
 
 class Document(KnowledgeInput):
@@ -75,6 +97,12 @@ class SearchResult(BaseModel):
     excerpt: str
 
 
+@dataclass(frozen=True)
+class SearchEvidence:
+    source: SearchResult
+    permissions: tuple[Permission, ...]
+
+
 class SearchResponse(BaseModel):
     results: list[SearchResult]
 
@@ -111,7 +139,12 @@ def replace_documents(settings: Settings, batch: Batch) -> None:
             document.id,
             document.title,
             document.version,
-            Jsonb([fragment.model_dump() for fragment in document.fragments]),
+            Jsonb(
+                [
+                    fragment.model_dump(exclude_none=True)
+                    for fragment in document.fragments
+                ]
+            ),
         )
         for document in batch.documents
     ]
@@ -157,15 +190,22 @@ def search(settings: Settings, token: str | None, query: str) -> SearchResponse 
 def find_fragments(
     conn: Connection[tuple[object, ...]], query: str
 ) -> list[SearchResult]:
+    return [evidence.source for evidence in find_evidence(conn, query)]
+
+
+# 權限事實和來源文字由同一 SELECT 擷取；內部資料不進公開 DTO 或模型交換。
+def find_evidence(
+    conn: Connection[tuple[object, ...]], query: str
+) -> list[SearchEvidence]:
     # 以單一 SELECT 取得完整舊批或新批。C collation 只折疊 ASCII 大小寫，
     # strpos 不把百分號或底線當成樣式；依穩定來源識別排序後取有界結果。
-    with conn.cursor(row_factory=class_row(SearchResult)) as cursor:
+    with conn.cursor(row_factory=dict_row) as cursor:
         cursor.execute(
             """
             SELECT d.id AS document_id, d.title, d.version,
-                   f.id AS fragment_id, f.text AS excerpt
+                   f.id AS fragment_id, f.text AS excerpt, f.permissions
             FROM knowledge_documents AS d
-            CROSS JOIN LATERAL jsonb_to_recordset(d.fragments) AS f(id text, text text)
+            CROSS JOIN LATERAL jsonb_to_recordset(d.fragments) AS f(id text, text text, permissions jsonb)
             CROSS JOIN (SELECT lower(%s::text COLLATE "C") AS term) AS q
             WHERE strpos(lower(d.title COLLATE "C"), q.term) > 0
                OR strpos(lower(f.text COLLATE "C"), q.term) > 0
@@ -174,4 +214,16 @@ def find_fragments(
             """,
             (query, RESULT_LIMIT),
         )
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+
+    # 保留可序列化的公開來源與不外傳的權限事實，舊文件缺欄時視為未列明。
+    return [
+        SearchEvidence(
+            source=SearchResult.model_validate(row),
+            permissions=tuple(
+                Permission.model_validate(permission)
+                for permission in (row["permissions"] or [])
+            ),
+        )
+        for row in rows
+    ]

@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS activation (
 -- 每日全服務用量與每筆請求的送達狀態分開記錄。
 CREATE TABLE IF NOT EXISTS daily_model_quota (
     service_day date PRIMARY KEY,
-    used integer NOT NULL CHECK (used BETWEEN 0 AND 100)
+    used integer NOT NULL CONSTRAINT daily_model_quota_used_nonnegative CHECK (used >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS model_requests (
@@ -23,6 +23,21 @@ CREATE TABLE IF NOT EXISTS model_requests (
 );
 
 INSERT INTO activation DEFAULT VALUES ON CONFLICT DO NOTHING;
+
+-- 僅舊版升級鎖住用量表；先等共用交易鎖，避免與先結算明細的取消操作互等。
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'daily_model_quota'::regclass AND conname = 'daily_model_quota_used_check'
+    ) THEN
+        PERFORM pg_advisory_xact_lock(7680281636712970524);
+        ALTER TABLE daily_model_quota
+            DROP CONSTRAINT daily_model_quota_used_check,
+            ADD CONSTRAINT daily_model_quota_used_nonnegative CHECK (used >= 0);
+    END IF;
+END;
+$$;
 
 -- 初始角色與帳號識別固定；資料庫只保存帶鹽的密碼雜湊。
 CREATE TABLE IF NOT EXISTS demo_accounts (
@@ -67,10 +82,6 @@ ALTER TABLE model_requests
 CREATE INDEX IF NOT EXISTS model_requests_rejected_binding
     ON model_requests (rejected_key_version, rejected_verified_sequence)
     WHERE rejected_key_version IS NOT NULL;
-
--- 個人額度只計入已送出及狀態不明的請求。
-CREATE INDEX IF NOT EXISTS model_requests_account_quota
-    ON model_requests (username, service_day) WHERE delivery <> 'unsent';
 
 -- 到期後連同對話所屬問題與嘗試一併移除。
 CREATE TABLE IF NOT EXISTS conversations (

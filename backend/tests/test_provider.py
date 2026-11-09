@@ -79,7 +79,7 @@ def transport(
         ),
         (401, {"error": {"status": "UNAUTHENTICATED"}}, "invalid", "sent"),
         (403, {"error": {"status": "PERMISSION_DENIED"}}, None, "sent"),
-        (429, {"error": {"status": "RESOURCE_EXHAUSTED"}}, None, "sent"),
+        (429, {"error": {"status": "RESOURCE_EXHAUSTED"}}, "rate_limited", "sent"),
         (500, {"error": {"status": "INTERNAL"}}, None, "sent"),
         (307, None, None, "sent"),
         ("timeout", None, None, "unknown"),

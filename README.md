@@ -1,10 +1,14 @@
 # AI 客服工單與知識查詢
 
-目前提供本機啟動、Gemini 啟用、示範帳號登入登出、知識搜尋、當頁多輪 AI 問答、同題重試，以及手動建單、工單查閱與客服結案。FastAPI 同源提供 Nuxt 靜態頁面，並使用 PostgreSQL 18 保存啟用狀態、模型用量、工作階段、知識文件、暫存問答與工單快照。
+這是可在本機執行的客服工作台。使用者可以搜尋虛構的「星港工作台」知識文件、向 Gemini 提問及追問、核對引用，並手動把問題轉成工單。客服可以查看工單證據、填寫處理結果並結案，提單者可登入查看結果。
+
+- `frontend/` 使用 Nuxt 4 和 TypeScript，靜態輸出由 FastAPI 同源提供。
+- `backend/` 使用 Python、FastAPI 和 Pydantic，透過官方 Google GenAI SDK 的 Interactions API 呼叫 Gemini。模型可使用唯讀知識搜尋。
+- PostgreSQL 18 保存啟用狀態、用量、工作階段、知識文件、暫存問答與工單快照。Docker Compose 管理本機服務。
 
 ## 啟動與驗證
 
-需安裝支援 `up --wait` 的 Docker Compose，以及 Python 3.10 或以上版本。Docker 映像包含應用程式及前端建置使用的 Python、Node.js，主機只用 Python 執行本機設定命令。以下命令皆從本專案根目錄執行。
+主機需支援 POSIX 檔案權限與鎖定。本流程以 macOS 搭配 OrbStack 實測。請準備可執行 `sh` 的終端、支援 `up --wait` 的 Docker Compose，以及 Python 3.10 或以上版本（`python3`）。Docker 映像包含後端執行及前端建置環境，主機的 Python 用於本機設定。除非另有說明，命令都從本專案根目錄執行。
 
 ```sh
 ./bin/local up
@@ -12,7 +16,9 @@
 
 啟動成功後開啟 <http://127.0.0.1:8020/>。沒有設定 Key 也能啟動，畫面會顯示啟用說明。資料庫僅在本案的 Docker 網路內使用。
 
-先在 Google AI Studio 確認專案仍在免費層，然後執行以下命令。設定命令會在終端提示輸入 Key，輸入時不回顯。驗證命令結束後，重新整理畫面或使用畫面上的狀態更新操作。 [Google AI Studio API Key](https://aistudio.google.com/apikey) · [Gemini API 費用與免費層](https://ai.google.dev/gemini-api/docs/billing)
+在 Google AI Studio 登入 Google 帳號，首次使用時依畫面接受服務條款。在 API Keys 頁面可使用預設專案的 Key，或選擇「Create API key」為指定專案建立 Key。確認該 Key 所屬專案的方案是 Free Tier，並確認目前可在免費層使用 `gemini-3.5-flash-lite`，即可在免費額度內示範。 [Google AI Studio API Keys](https://aistudio.google.com/apikey) · [Google Key 設定指南](https://ai.google.dev/gemini-api/docs/api-key) · [計費方案](https://ai.google.dev/gemini-api/docs/billing) · [模型定價](https://ai.google.dev/gemini-api/docs/pricing)
+
+在終端執行以下命令。設定時貼上 Key 並按 Enter，輸入不回顯。驗證成功後，在頁面按「重新確認狀態」進入登入畫面。
 
 ```sh
 ./bin/local set-key
@@ -41,6 +47,15 @@
 - 重啟會沿用已建立的密碼，PostgreSQL 只保存 Argon2id 雜湊。請妥善保留原始私有檔案。如果檔案遺失或與資料庫不符，請還原原檔及私有權限後再啟動。
 - 以每個帳號與連線來源分別計算 15 分鐘時間窗。每個帳號最多 5 次，每個來源最多 20 次。登入成功也計入嘗試次數。達上限後，畫面會請你稍後再試。
 - 登入閒置 30 分鐘或累計 8 小時後失效。共用裝置使用完畢後，請在工作台登出。登出會立即撤銷目前的工作階段。
+
+## 完整示範
+
+1. 依[啟動與驗證](#啟動與驗證)啟動服務和驗證 Key。執行 `./bin/local import-knowledge` 載入虛構文件。用 `user` 和[示範密碼](#示範登入)登入，搜尋 `export-104` 可先確認已匯入知識。
+2. 在「提出問題」送出「我匯出報表時遇到 EXPORT-104，該怎麼處理？」。回答應指出把日期區間縮短至 31 天以內再匯出。在「引用來源」核對 `report-export / v1 / export-104`。
+3. 在同一頁輸入「修好之後，去哪裡拿檔案？檔案是什麼格式？」並按「追問」。回答應指向「下載紀錄」及 CSV，引用 `report-export / v1 / export-steps`。
+4. 在第 2 題按「建立工單」。在預填描述補上「原始情境是匯出時遇到 EXPORT-104。」後按「送出工單」。記下單號，核對明細的原始問題、描述、回答與來源。
+5. 登出並改用 `support` 登入。在「全部工單」找到該單，按「查看工單」。填寫處理結果，例如「已確認報表可在下載紀錄取得，格式為 CSV。」後按「結案」。確認狀態顯示「已結案」。
+6. 登出並以 `user` 再登入。在「我的工單」開啟同一單號，核對結案時間、處理結果和先前保存的證據。
 
 ## 匯入與搜尋知識文件
 
@@ -101,6 +116,8 @@ HTTP 呼叫者可使用 `POST /api/tickets` 建單，傳入 `question_id`、`att
 
 ## 開發與測試
 
+修改工作台可從 [Nuxt 頁面](frontend/app/pages/index.vue) 與 [元件](frontend/app/components/) 開始，HTTP 入口在 [FastAPI 應用程式](backend/app.py)。修改後執行 `./bin/local up`，重新建置 Docker 映像並以同源方式操作工作台。
+
 ```sh
 ./bin/local check
 ./bin/local test
@@ -128,13 +145,7 @@ node tests/fixture-server.mjs invalid 18021
 
 模式包括 `unconfigured`、`unverified`、`ready`、`invalid`、`unavailable`（503）、`malformed`（不符合契約）及 `timeout`（超過前端十秒界線）。埠號可省略，預設為 8021，只能綁定本機。這個工具提供前端建置結果與固定測試狀態。`ready` 會顯示未登入的表單，完整登入流程請用 `./bin/local up` 與實際 PostgreSQL 驗證。
 
-加入單輪問答前，已通過 68 項後端測試、Python 靜態檢查、前端格式／型別／建置，以及桌面與手機的雙角色登入與登出檢查。先前已以虛構 `AQ.` 資料驗證終端的隱藏輸入、儲存與損毀復原。2026-11-07 已完成一次真實 Gemini 啟用驗證，頁面與 API 均為 `ready`。重啟及更新後保留啟用狀態，本機記錄的模型請求與當日用量皆維持 1 次。知識搜尋另在隔離的 PostgreSQL 18 與 Chrome 桌面、手機視窗驗證。匯入失敗後舊批仍可查，搜尋不新增模型用量。單輪問答加入後，119 項後端測試通過。隔離環境以真實 Gemini 驗收一題虛構的 EXPORT-104 問題，確認模型呼叫知識工具並引用正確片段。該次驗收計入 1 次啟用及 2 次問答請求。完整引用品質題組另行驗收。
-
-加入多輪問答後，138 項隔離 PostgreSQL 測試、Python 靜態檢查及 Node 24.22.2 格式、型別與建置均通過。Chrome 桌面及手機已用真實本機 HTTP、PostgreSQL 和受控 Gemini 傳輸確認追問、引用、同題重試、草稿保留、重整及登出隔離。隔離環境以真實 Gemini 驗收一組 EXPORT-104 首題與追問，兩輪均各自搜尋並正確引用，分別用時 2.004 秒、2.169 秒；共 1 次啟用驗證及 4 次問答請求。
-
-加入工單後，149 項隔離 PostgreSQL 測試、Python 靜態檢查、4 項串流測試，以及 Node 24.22.2 的格式、型別與建置檢查通過。Chrome 桌面及 320px 手機以本機 HTTP、PostgreSQL 和受控模型傳輸驗證成功、失敗與處理中建單、重送、分頁及帳號隔離。
-
-加入客服結案後，155 項隔離 PostgreSQL 測試、Python 靜態檢查、7 項前端測試與 Node 24.22.2 的格式、型別及建置檢查通過。隔離 HTTP 驗證舊工單升級、重啟、角色邊界及競爭結案；Chrome 桌面及 320px 手機驗證客服結案、衝突與結果讀回，以及提單者唯讀查閱。這次使用受控模型傳輸，未呼叫真實 Gemini。
+## HTTP API
 
 應用程式的 HTTP 存活檢查是 `GET /health`。啟用頁使用 `GET /api/setup`，回傳 `status`、`message`、`model`。驗證由本機命令觸發。
 
@@ -147,6 +158,14 @@ node tests/fixture-server.mjs invalid 18021
 `POST /api/answers` 需同源及有效的登入 Cookie，本文可為首題 `{"question":"…"}`、追問 `{"question":"…","conversation_id":"…"}`，或手動重試 `{"conversation_id":"…","question_id":"…","attempt_id":"…"}`。重試必須指定該問題目前失敗的嘗試；會回傳相同的對話和問題識別，以及新的嘗試識別。瀏覽器不能提交前文、模型步驟或引用。HTTP `200` 為本次嘗試的終態，包含 `conversation_id`、`question_id`、`attempt_id`、`status`、`answer`、`model`、`citations` 及 `search_results`。引用與搜尋結果使用上述知識片段欄位。只有 `answered` 帶回答與引用，其他終態（`insufficient_evidence`、`invalid_output`、`rate_limited`、`timed_out`、`unavailable`）仍可附上本次搜尋結果。欄位錯誤、未登入、來源驗證失敗及目前無法處理時，分別回傳 `422`、`401`、`403`、`503`。其他帳號或找不到的對話不公開資料，回傳 `404`；對話仍存在但已到期回傳 `410`；忙碌、達上限、過時重試或無可延續前文則回傳 `409`。
 
 `GET /api/answers/{attempt_id}` 可由有效登入的擁有者查閱該問題目前已完成且仍在暫存期限內的結果，不延長期限或再次呼叫模型。識別不存在、已被重試取代或不屬於目前帳號時回傳 `404`，尚未清理的到期結果回傳 `410`。工作台只在當前頁面記住問答識別，不提供歷史列表或恢復入口。
+
+## 實測結果
+
+2026-11-10，隔離 PostgreSQL 的 231 項後端測試及 Python 語法、Ruff、mypy、套件相容性檢查通過。Node.js 24.22.2 的 7 項前端測試、格式、型別檢查和 Nuxt 靜態建置通過。
+
+在 Chrome 桌面 1440px 與手機 320px 視窗，依本文件驗證啟用及登入，並各完成兩輪真實問答、手動建單、客服結案和提單者讀回。畫面上的引用、結案結果與 API 及 PostgreSQL 一致。隔離服務重啟後保留既有工單、啟用狀態和模型用量。
+
+真實 `gemini-3.5-flash-lite` 固定題組通過 20 案、共 23 輪。有依據的 10 案均完整正確（含 3 案兩輪追問），5 案資料不足均未編造，5 案誘導均未觀察到越權。成功回答的引用與本輪知識搜尋結果逐一核對。通過的題組共送出 53 筆問答模型請求，包含工具往返。每輪耗時 7.157 至 18.518 秒，包含驗收時安排的請求間隔。後續修訂以同一批已記錄的模型結果離線重播，23 輪的終態、回答、引用及搜尋結果一致。題組涵蓋隨附虛構知識及專為驗收準備的片段。
 
 ### 非模型 API 效能
 
@@ -187,3 +206,9 @@ JSON 包含寫完 HTTP 請求的送出量、收到完整回應的筆數、各筆
 | 客服結案 | 120 | 38.08 ms |
 
 共送出並完成 600 筆，每秒 10 筆，沒有非預期 HTTP 或資料錯誤。資料庫讀回 1,120 張工單，其中 121 張已結案（含暖機的一張）；模型請求及配額紀錄均為零。首輪有一個清單時槽未送出，599 筆未達標；以上為修正送出量計量後，以相同負載重跑的結果。本機基準僅反映這組資料、硬體與負載，真實模型延遲另行驗收。
+
+## 使用限制
+
+- 本版供本機展示，HTTP 綁定 loopback。手機版可用同一台電腦的瀏覽器裝置模式檢查。只有兩種固定示範帳號。
+- 知識資料透過本機 JSON 匯入。問答品質取決於文件內容、可查得的片段與供應商狀態。固定題組只代表該批案例。遇到資料不足或限流可查看已取得的證據，並手動建單。
+- 對話只在目前頁面延續。工單可保留建單時的證據，結案結果唯讀。

@@ -8,6 +8,8 @@
 !backend/requirements*.txt
 !backend/tests/
 !backend/tests/*.py
+!knowledge/
+!knowledge/documents.json
 !frontend/
 !frontend/**
 frontend/.env

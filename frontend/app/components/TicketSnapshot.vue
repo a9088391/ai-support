@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
   answerStatusMessages,
+  answerStatusTitles,
   ticketTime,
   type TicketDetail,
 } from "~/workbench/contracts";
@@ -49,48 +50,53 @@ defineProps<{
       </div>
     </dl>
 
-    <section
-      class="knowledge-search-state"
-      aria-labelledby="ticket-description-heading"
-    >
-      <h3 id="ticket-description-heading">問題描述</h3>
-      <p class="answer-text">{{ ticket.description }}</p>
-    </section>
+    <div class="ticket-file">
+      <section
+        class="knowledge-search-state"
+        aria-labelledby="ticket-description-heading"
+      >
+        <h3 id="ticket-description-heading">問題描述</h3>
+        <p class="answer-text">{{ ticket.description }}</p>
+      </section>
 
-    <slot />
-
-    <section
-      v-if="ticket.status === 'closed'"
-      class="knowledge-search-state"
-      aria-labelledby="ticket-resolution-heading"
-    >
-      <h3 id="ticket-resolution-heading">處理結果</h3>
-      <p class="answer-text">{{ ticket.resolution }}</p>
-    </section>
-
-    <section
-      class="knowledge-search-state"
-      aria-labelledby="ticket-evidence-heading"
-    >
-      <h3 id="ticket-evidence-heading">原始問答快照</h3>
-      <h4>原始問題</h4>
-      <p class="answer-text">{{ ticket.question }}</p>
-      <template v-if="ticket.answer_status === 'answered'">
-        <h4>回答</h4>
-        <p class="answer-text">{{ ticket.answer }}</p>
-        <h4>引用來源</h4>
-        <KnowledgeResultList :results="ticket.citations" />
-      </template>
-      <template v-else>
-        <h4>回答狀態</h4>
-        <p>{{ answerStatusMessages[ticket.answer_status] }}</p>
-      </template>
-      <h4>建單時已取得的搜尋結果</h4>
-      <KnowledgeResultList
-        v-if="ticket.search_results.length"
-        :results="ticket.search_results"
-      />
-      <p v-else>建單時沒有可保存的搜尋結果。</p>
-    </section>
+      <section
+        class="knowledge-search-state"
+        aria-labelledby="ticket-evidence-heading"
+      >
+        <h3 id="ticket-evidence-heading">原始問答快照</h3>
+        <h4>原始問題</h4>
+        <p class="answer-text">{{ ticket.question }}</p>
+        <template v-if="ticket.answer_status === 'answered'">
+          <h4>回答</h4>
+          <p class="answer-text">{{ ticket.answer }}</p>
+          <h4>引用來源</h4>
+          <KnowledgeResultList :results="ticket.citations" />
+        </template>
+        <template v-else>
+          <!-- 保存的不足或技術狀態沿用工作台標題，避免回查時混淆原因。 -->
+          <h4>{{ answerStatusTitles[ticket.answer_status] }}</h4>
+          <p>{{ answerStatusMessages[ticket.answer_status] }}</p>
+        </template>
+        <details class="ticket-saved-search">
+          <summary>建單時已取得的搜尋結果</summary>
+          <KnowledgeResultList
+            v-if="ticket.search_results.length"
+            :results="ticket.search_results"
+          />
+          <p v-else>建單時沒有可保存的搜尋結果。</p>
+        </details>
+      </section>
+    </div>
+    <aside class="ticket-resolution" aria-label="處理結果與結案操作">
+      <slot />
+      <section
+        v-if="ticket.status === 'closed'"
+        class="knowledge-search-state"
+        aria-labelledby="ticket-resolution-heading"
+      >
+        <h3 id="ticket-resolution-heading">處理結果</h3>
+        <p class="answer-text">{{ ticket.resolution }}</p>
+      </section>
+    </aside>
   </div>
 </template>

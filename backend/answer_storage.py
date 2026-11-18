@@ -567,7 +567,8 @@ def search_attempt(
                     deadline, monotonic() + check_attempt_window(window)
                 )
                 bound_transaction(conn, query_deadline)
-                results = knowledge.find_evidence(conn, query)
+                # 模型每次只取排名前八段完整來源；保存與回傳同一批，手動搜尋仍可取二十段。
+                results = knowledge.find_evidence(conn, query)[:8]
                 require_time(query_deadline)
 
                 # 只有期限內且仍經授權的真實結果可交給模型或保留為證據。

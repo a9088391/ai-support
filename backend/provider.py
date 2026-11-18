@@ -135,8 +135,10 @@ AnswerFailure = Literal[
 ]
 SEARCH_TOOL = "search_knowledge"
 ANSWER_INSTRUCTION = """你是客服知識助理，以臺灣繁體中文回覆。
-回答前先呼叫 search_knowledge。每次只用一個可能逐字出現在文件標題或內文的短詞，
-例如功能名、角色名或錯誤代碼。不要把多個概念拼在一起，也不要用整個問句。
+每個新問題與跨主題追問，回答前都必須重新呼叫 search_knowledge；前題的工具結果不是本輪證據。以問題的主題、地名、名稱、功能名、角色名或錯誤代碼搜尋。
+工具支援中文問句、臺台異體字與多個關鍵詞，優先使用能辨識主題的精簡關鍵詞。
+地理、歷史、文化與交通問題需依來源區分適用範圍、時間、單位及比較基準；
+例如天然湖泊與人工水庫、面積與容量不能混為同一排名。複合問題的各部分都必須有來源。
 角色權限問題第一次只搜尋角色名稱，去掉所屬範圍前綴與操作，例如「工作區檢視者」只搜尋「檢視者」。
 角色權限問題若第一次無結果，第二次只搜尋問題中的單一資源名稱，例如「共享報表」，不要與角色或操作拼接。
 本輪最多搜尋兩次，一次只呼叫一個工具。第一次搜尋無結果或不足以回答時，第二次改用不同的核心短詞。
@@ -148,7 +150,7 @@ ANSWER_INSTRUCTION = """你是客服知識助理，以臺灣繁體中文回覆�
 不可推論為允許或禁止；相鄰操作的資料不能證明所問權限，evidence_sufficient 必須為 false。
 最後只輸出一個 JSON 物件，不加 Markdown：
 {"evidence_sufficient":true,"answer":"有來源支持的回答","citations":[1]}
-evidence_sufficient 是必填布林值，只有本輪證據足以回答所問操作或權限時才為 true。
+evidence_sufficient 是必填布林值，只有本輪證據足以回答問題的各部分時才為 true。
 citations 只能填入實際支持回答的 evidence_id（正整數）。若無充分依據，
 輸出 {"evidence_sufficient":false,"answer":null,"citations":[]}。不得自行編造回答、來源或識別。"""
 
@@ -207,12 +209,23 @@ async def request_answer(
                         generation_config={
                             "thinking_level": "minimal",
                             "max_output_tokens": 2048,
+                            # 受信任歷程以新問題結尾時強制重新搜尋；工具回傳後恢復自由決定。
+                            "tool_choice": (
+                                {
+                                    "allowed_tools": {
+                                        "mode": "any",
+                                        "tools": [SEARCH_TOOL],
+                                    }
+                                }
+                                if history and history[-1]["type"] == "user_input"
+                                else "auto"
+                            ),
                         },
                         tools=[
                             {
                                 "type": "function",
                                 "name": SEARCH_TOOL,
-                                "description": "以一個可能逐字出現在文件標題或內文的短詞搜尋本機客服知識文件。",
+                                "description": "搜尋本機知識文件；支援中文問句或精簡關鍵詞，回傳依相關性排序的真實來源片段。",
                                 "parameters": {
                                     "type": "object",
                                     "properties": {"query": {"type": "string"}},

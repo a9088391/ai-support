@@ -11,6 +11,7 @@ COPY backend/requirements-dev.txt backend/requirements-dev.txt
 RUN python -m pip install --disable-pip-version-check --no-cache-dir -r backend/requirements-dev.txt
 COPY backend/*.py backend/schema.sql backend/pyproject.toml backend/
 COPY backend/tests/ backend/tests/
+COPY knowledge/ knowledge/
 CMD ["python", "-m", "pytest", "-q", "backend/tests"]
 
 FROM node:24.22.2@sha256:e7add2a490bb17d97b485b8641bd88455fff7839ade0f5eba493c3508124d413 AS frontend

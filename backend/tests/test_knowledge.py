@@ -384,7 +384,7 @@ def test_literal_search(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> 
         assert search(client, query).json() == {
             "results": ORIGINAL_RESULTS["results"][:1]
         }
-    for query in ("送貨", "EXAMPLE%100", "退 貨", "' OR 1=1 --", "中" * 2000):
+    for query in ("送貨", "EXAMPLE%100", "' OR 1=1 --", "中" * 2000):
         assert search(client, query).json() == {"results": []}
 
     # 直接送原始本文，保留 JSON 重複名稱與無法傳入 PostgreSQL 的碼位。
@@ -409,7 +409,7 @@ def test_literal_search(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> 
         assert result.json() == SEARCH_INVALID
 
 
-# 多份文件命中時仍依來源順序取前 20 筆，與匯入順序無關。
+# 多份文件相關性相同時依來源順序取前 20 筆，與匯入順序無關。
 def test_search_caps_sorted_results(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -726,3 +726,95 @@ def test_application_recipient_requires_denial_and_preserves_legacy() -> None:
     )
     with pytest.raises(ValueError):
         knowledge.Permission.model_validate(updated | {"effect": "allow"})
+
+
+# 自然問句與字形正規化共用 HTTP 入口，排名必須先於結果截斷。
+def test_search_normalizes_and_ranks_chinese(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 先放超過上限的弱相關片段，避免文件識別排序掩蓋正確來源。
+    noise = [
+        {"id": f"p-{n}", "text": "臺灣位於亞洲，這是地方介紹。"} for n in range(30)
+    ]
+    batch = {
+        "documents": [
+            {"id": "a", "title": "臺灣", "version": "v1", "fragments": noise},
+            {
+                "id": "z",
+                "title": "臺灣地理",
+                "version": "v1",
+                "fragments": [
+                    {"id": "area", "text": "臺灣本島面積為35,886.8623平方公里。"},
+                    {
+                        "id": "name",
+                        "text": "西方國家歷史上稱臺灣為福爾摩沙（Formosa）。",
+                    },
+                    {"id": "peak", "text": "臺灣最高峰玉山主峰海拔3,952公尺。"},
+                ],
+            },
+        ]
+    }
+    assert import_batch(monkeypatch, batch) == 0
+    assert client.post("/api/login", headers=CSRF, json=USER_FORM).status_code == 200
+
+    # 各種字形、空白與問句仍須把實際支持內容排在首位。
+    for query, expected in (
+        ("臺灣的面積多大", "area"),
+        ("台灣 面積", "area"),
+        ("臺　灣的面積是多少？", "area"),
+        ("西方國家在歷史上稱台灣為什麼？", "name"),
+        ("ｆＯＲＭＯＳＡ", "name"),
+        ("福爾摩沙", "name"),
+        ("臺灣最高峰是？有多高？", "peak"),
+        ("面積", "area"),
+    ):
+        response = search(client, query)
+        assert response.status_code == 200
+        results = response.json()["results"]
+        assert results and results[0]["fragment_id"] == expected, query
+        assert len(results) <= knowledge.RESULT_LIMIT
+
+    # 停用詞、微小共字及未支持的 ASCII 識別不得擴成無關結果。
+    for query in ("是什麼", "地方的火星學說", "Formosa%injection", "' OR 1=1 --"):
+        assert search(client, query).json() == {"results": []}
+
+
+@pytest.mark.parametrize(
+    ("named_text", "expected_ids"),
+    [
+        ("海港交通路線資料", ["z", "a", "b"]),
+        ("海港交通景點", ["a", "b", "z"]),
+    ],
+)
+# 完整文件名稱只打破同分；更高內容相關性仍優先，其餘同分保留來源順序。
+def test_search_uses_full_title_only_to_break_score_ties(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    named_text: str,
+    expected_ids: list[str],
+) -> None:
+    # 相同文字讓 a、b 確定同分，z 的內容差異分別驗證同分與非同分邊界。
+    batch = {
+        "documents": [
+            {
+                "id": identifier,
+                "title": title,
+                "version": "v1",
+                "fragments": [{"id": "guide", "text": text}],
+            }
+            for identifier, title, text in (
+                ("a", "旅行", "海港交通路線資料"),
+                ("b", "沿岸", "海港交通路線資料"),
+                ("z", "海港", named_text),
+            )
+        ]
+    }
+    assert import_batch(monkeypatch, batch) == 0
+    assert client.post("/api/login", headers=CSRF, json=USER_FORM).status_code == 200
+
+    # 公開搜尋排序須符合已知文字關係，不從受測計分函式重算期望值。
+    response = search(client, "海港交通路線")
+    assert response.status_code == 200
+    assert [
+        result["document_id"] for result in response.json()["results"]
+    ] == expected_ids

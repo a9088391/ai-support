@@ -30,6 +30,7 @@ from backend.answer_storage import (
 from backend.app import create_app
 from backend.credentials import set_key
 from backend.database import Settings, initialize, reserve_request
+from backend.provider import request_answer
 from backend.tests.conftest import TEST_DSN
 from backend.tests.test_activation import (
     assert_previous_day_reservation,
@@ -3170,3 +3171,380 @@ def test_compound_follow_up_carries_delivered_context_only(
         ).fetchone()
         assert row is not None and isinstance(row[0], list)
         assert row[0][-2:] == [THOUGHT, final_step]
+
+
+# 自然問句的模型工具仍須走共用排名，引用與讀回只能採用本輪真實來源。
+def test_answer_tool_uses_ranked_natural_query(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+) -> None:
+    # 語料先由正式匯入 DTO 寫入；模型替身只控制工具要求及最終 JSON。
+    batch = {
+        "documents": [
+            {
+                "id": "geography",
+                "title": "臺灣地理",
+                "version": "v2",
+                "fragments": [
+                    {"id": "area", "text": "臺灣本島面積為35,886.8623平方公里。"},
+                    {"id": "name", "text": "臺灣在西方歷史上稱為福爾摩沙。"},
+                ],
+            }
+        ]
+    }
+    assert import_batch(monkeypatch, batch) == 0
+    query = "台灣的面積多大？"
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", {**CALL, "arguments": {"query": query}}),
+            model_output("臺灣本島面積為35,886.8623平方公里。", [1]),
+        ]
+    )
+
+    # HTTP 終態及再次讀回保留相同當輪摘錄，不能靠模型提供來源文字。
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        response = ask(browser, query)
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "answered"
+        assert payload["citations"][0]["fragment_id"] == "area"
+        assert payload["citations"] == payload["search_results"]
+        assert browser.get(f"{ANSWERS}/{payload['attempt_id']}").json() == payload
+    assert len(provider_script.requests) == 2
+
+
+# 每題第一個 SDK 請求強制唯一搜尋，帶回工具結果後才允許回答，前題步驟不影響判斷。
+def test_each_question_requires_search_before_auto_answer(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+) -> None:
+    # 在同一對話安排兩題及其真實搜尋往返，第二題也保有第一題的簽章與來源歷程。
+    assert import_batch(monkeypatch, ORIGINAL) == 0
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", THOUGHT, CALL),
+            model_output("一般配送需兩個工作天。", [2]),
+            interaction(
+                "requires_action", THOUGHT, {**CALL, "id": "fresh-second-question"}
+            ),
+            model_output("一般配送需兩個工作天。", [2]),
+        ]
+    )
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        first = ask(browser).json()
+        response = browser.post(
+            ANSWERS,
+            headers=CSRF,
+            json={
+                "question": "我想再確認一般配送要幾天？",
+                "conversation_id": first["conversation_id"],
+            },
+        )
+        assert response.status_code == 200
+        second = response.json()
+        assert first["status"] == second["status"] == "answered"
+        assert first["question_id"] != second["question_id"]
+        assert second["citations"] == first["citations"]
+        assert browser.get(f"{ANSWERS}/{second['attempt_id']}").json() == second
+
+    # 核對實際通過 SDK 的 HTTP 本文；第二題不能因前文已有搜尋而退回 auto 首請求。
+    requests = [
+        json.loads(raw.split(b"\r\n\r\n", 1)[1]) for raw in provider_script.requests
+    ]
+    required = {"allowed_tools": {"mode": "any", "tools": ["search_knowledge"]}}
+    assert [
+        request["generation_config"].get("tool_choice") for request in requests
+    ] == [
+        required,
+        "auto",
+        required,
+        "auto",
+    ]
+    assert [request["input"][-1]["type"] for request in requests] == [
+        "user_input",
+        "function_result",
+        "user_input",
+        "function_result",
+    ]
+    assert requests[2]["input"][:-1] == [
+        *requests[1]["input"],
+        *model_output("一般配送需兩個工作天。", [2]).json()["steps"],
+    ]
+    assert all(request["store"] is False for request in requests)
+    assert len(requests) == 4
+
+
+# 雖然正式問答總會附新問題，空歷程也須安全採 auto，避免 provider 以索引例外失敗。
+def test_answer_provider_handles_empty_history(provider_script: ProviderScript) -> None:
+    provider_script.responses.append(model_output(None, []))
+
+    # 此測試只檢查 SDK 序列化，固定 fixture Key 與受控串流不接觸正式憑證或外部服務。
+    async def trace(_event: str, _info: dict[str, object]) -> None:
+        return
+
+    exchange = anyio.run(request_answer, FIXTURE_KEY, [], trace)
+    assert exchange.result is not None and exchange.result.status == "completed"
+    assert len(provider_script.requests) == 1
+    request = json.loads(provider_script.requests[0].split(b"\r\n\r\n", 1)[1])
+    assert request["generation_config"].get("tool_choice") == "auto"
+
+
+# 兩組足量片段提供明確來源順序；第九段的額外權限不能被前八段借用。
+def model_budget_batch(*, shared_count: int = 0) -> knowledge.Batch:
+    # 每段保留完整文字及內部閱讀事實，僅 a-08 額外列明匯出權限。
+    fragments = []
+    for group in ("a", "b"):
+        for index in range(24):
+            text = f"batch-{group} 檢視者可閱讀共享報表。完整段落 {group}-{index:02}。"
+            if group == "a" and index < shared_count:
+                text += " batch-b 共用來源。"
+            permissions = [
+                knowledge.Permission(
+                    role="viewer",
+                    action="read",
+                    resource="shared_reports",
+                    effect="allow",
+                )
+            ]
+            # 第九段的額外事實用來證明未交付來源不能補足前八段的權限缺口。
+            if group == "a" and index == 8:
+                permissions.append(
+                    knowledge.Permission(
+                        role="viewer",
+                        action="export",
+                        resource="shared_reports",
+                        effect="allow",
+                    )
+                )
+                text += " 此段另記檢視者可匯出共享報表。"
+            fragments.append(
+                knowledge.Fragment(
+                    id=f"{group}-{index:02}", text=text, permissions=permissions
+                )
+            )
+
+    # 正式匯入 DTO 維持來源識別、版本及權限格式，測試不繞過信任邊界。
+    return knowledge.Batch(
+        documents=[
+            knowledge.Document(
+                id="budget", title="來源預算", version="v1", fragments=fragments
+            )
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_status"),
+    [
+        ("answer", "answered"),
+        ("unseen_citation", "invalid_output"),
+        ("unseen_permission", "insufficient_evidence"),
+        ("rate_limited", "rate_limited"),
+        ("unavailable", "unavailable"),
+    ],
+)
+# 手動搜尋保留二十段，模型只見八段；未見引用、隱藏權限與外部失敗均不能冒充成功。
+def test_model_context_budget_preserves_evidence_boundary(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+    case: str,
+    expected_status: str,
+) -> None:
+    # 由固定匯入原文建立獨立 oracle，避免只比較兩條可能同時出錯的輸出路徑。
+    batch = model_budget_batch()
+    assert import_batch(monkeypatch, batch.model_dump(exclude_none=True)) == 0
+    expected = [
+        {
+            "document_id": "budget",
+            "title": "來源預算",
+            "version": "v1",
+            "fragment_id": fragment.id,
+            "excerpt": fragment.text,
+        }
+        for fragment in batch.documents[0].fragments[:20]
+    ]
+    call = {**CALL, "arguments": {"query": "batch-a"}}
+    provider_script.responses.append(interaction("requires_action", THOUGHT, call))
+    if case in {"rate_limited", "unavailable"}:
+        code = 429 if case == "rate_limited" else 503
+        label = "rate_limit_exceeded" if code == 429 else "service_unavailable"
+        provider_script.responses.append(
+            httpx.Response(
+                code, json={"error": {"code": label, "message": FIXTURE_KEY}}
+            )
+        )
+    else:
+        provider_script.responses.append(
+            model_output(
+                "檢視者可閱讀共享報表。", [9 if case == "unseen_citation" else 8]
+            )
+        )
+
+    # HTTP、持久讀回及工單均保存同一實際八段快照，內部權限不外傳。
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        manual = browser.post(
+            "/api/knowledge/search", headers=CSRF, json={"query": "batch-a"}
+        )
+        assert manual.status_code == 200 and manual.json()["results"] == expected
+
+        # 第八段仍可支持閱讀；第九段或未列於引用的匯出權限必須被拒絕。
+        question = (
+            "檢視者能匯出共享報表嗎？"
+            if case == "unseen_permission"
+            else "檢視者能閱讀共享報表嗎？"
+        )
+        response = ask(browser, question)
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == expected_status
+        assert payload["search_results"] == expected[:8]
+        assert payload["citations"] == ([expected[7]] if case == "answer" else [])
+        assert payload["answer"] == (
+            "檢視者可閱讀共享報表。" if case == "answer" else None
+        )
+        assert browser.get(f"{ANSWERS}/{payload['attempt_id']}").json() == payload
+
+        # 成功或失敗建單均使用本次已保存來源，不重新查詢以補入未交付片段。
+        ticket = browser.post(
+            "/api/tickets",
+            headers=CSRF,
+            json={
+                "question_id": payload["question_id"],
+                "attempt_id": payload["attempt_id"],
+                "description": "核對來源預算",
+            },
+        )
+        assert ticket.status_code == 200
+        assert ticket.json()["search_results"] == expected[:8]
+        assert ticket.json()["answer_status"] == expected_status
+        assert "permissions" not in response.text + manual.text + ticket.text
+        assert FIXTURE_KEY not in response.text
+
+    # 核對真正 SDK wire 的八段完整原文、證據編號與簽章，並確認失敗也照常結算。
+    assert len(provider_script.requests) == 2
+    wire = [
+        json.loads(raw.split(b"\r\n\r\n", 1)[1]) for raw in provider_script.requests
+    ]
+    assert wire[1]["input"][:3] == [*wire[0]["input"], THOUGHT, call]
+    tool_result = wire[1]["input"][-1]
+    assert tool_result["type"] == "function_result"
+    assert json.loads(tool_result["result"][0]["text"]) == [
+        {"evidence_id": index + 1, **source}
+        for index, source in enumerate(expected[:8])
+    ]
+    assert all(b"permissions" not in raw for raw in provider_script.requests)
+    with answer_ready.connect() as conn:
+        assert conn.execute(
+            "SELECT search_results FROM answer_attempts WHERE id = %s",
+            (payload["attempt_id"],),
+        ).fetchone() == (expected[:8],)
+        assert conn.execute(
+            "SELECT delivery FROM model_requests WHERE username = 'user'"
+        ).fetchall() == [("sent",), ("sent",)]
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (3,)
+
+
+@pytest.mark.parametrize("shared_count", [0, 2])
+# 第二次搜尋可加入新的八段，重複來源沿用編號；後續題目保留完整歷史但重建當輪證據。
+def test_model_context_budget_second_search_and_history(
+    answer_ready: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_script: ProviderScript,
+    shared_count: int,
+) -> None:
+    # 固定排序讓第二批為全新八段或兩段重複加六段新來源，不依賴受測排名計算 oracle。
+    batch = model_budget_batch(shared_count=shared_count)
+    assert import_batch(monkeypatch, batch.model_dump(exclude_none=True)) == 0
+    source = [
+        {
+            "document_id": "budget",
+            "title": "來源預算",
+            "version": "v1",
+            "fragment_id": fragment.id,
+            "excerpt": fragment.text,
+        }
+        for fragment in batch.documents[0].fragments
+    ]
+    first_sources = source[:8]
+    second_sources = source[:shared_count] + source[24 : 32 - shared_count]
+    combined = first_sources + second_sources[shared_count:]
+    first_call = {**CALL, "arguments": {"query": "batch-a"}}
+    second_call = {**CALL, "id": "second-search", "arguments": {"query": "batch-b"}}
+    final_step = model_output("檢視者可閱讀共享報表。", [16 - shared_count]).json()[
+        "steps"
+    ][0]
+    provider_script.responses.extend(
+        [
+            interaction("requires_action", THOUGHT, first_call),
+            interaction("requires_action", THOUGHT, second_call),
+            interaction("completed", THOUGHT, final_step),
+            interaction("requires_action", THOUGHT, {**first_call, "id": "follow-up"}),
+            model_output("檢視者可閱讀共享報表。", [8]),
+        ]
+    )
+
+    # 最後一筆新來源可支持本題；下一題只接受重新搜尋的八段，公開讀回保持一致。
+    with TestClient(create_app(answer_ready), base_url=ORIGIN) as browser:
+        login(browser)
+        response = ask(browser, "檢視者能閱讀共享報表嗎？")
+        assert response.status_code == 200
+        first = response.json()
+        assert first["status"] == "answered"
+        assert first["search_results"] == combined
+        assert first["citations"] == [combined[-1]]
+        assert browser.get(f"{ANSWERS}/{first['attempt_id']}").json() == first
+        response = browser.post(
+            ANSWERS,
+            headers=CSRF,
+            json={
+                "question": "檢視者能閱讀共享報表嗎？",
+                "conversation_id": first["conversation_id"],
+            },
+        )
+        assert response.status_code == 200
+        follow_up = response.json()
+        assert follow_up["status"] == "answered"
+        assert follow_up["search_results"] == first_sources
+        assert follow_up["citations"] == [first_sources[-1]]
+
+    # 真正 SDK 本文的第二批維持八段，重複證據編號沿用，新增編號從九開始。
+    assert len(provider_script.requests) == 5
+    wire = [
+        json.loads(raw.split(b"\r\n\r\n", 1)[1]) for raw in provider_script.requests
+    ]
+    for request_index, expected_sources, identifiers in (
+        (1, first_sources, list(range(1, 9))),
+        (
+            2,
+            second_sources,
+            list(range(1, shared_count + 1)) + list(range(9, 17 - shared_count)),
+        ),
+        (4, first_sources, list(range(1, 9))),
+    ):
+        output = json.loads(wire[request_index]["input"][-1]["result"][0]["text"])
+        assert output == [
+            {"evidence_id": identifier, **item}
+            for identifier, item in zip(identifiers, expected_sources, strict=True)
+        ]
+    assert wire[3]["input"][:-1] == [*wire[2]["input"], THOUGHT, final_step]
+    assert all(b"permissions" not in raw for raw in provider_script.requests)
+
+    # 完整交換只保存一次；兩題共五次已送外呼，沒有因來源預算增添重試或配額。
+    with answer_ready.connect() as conn:
+        assert conn.execute(
+            "SELECT search_results, model_steps FROM answer_attempts WHERE id = %s",
+            (first["attempt_id"],),
+        ).fetchone() == (combined, wire[3]["input"][:-1])
+        assert (
+            conn.execute(
+                "SELECT delivery FROM model_requests WHERE username = 'user'"
+            ).fetchall()
+            == [("sent",)] * 5
+        )
+        assert conn.execute("SELECT used FROM daily_model_quota").fetchone() == (6,)

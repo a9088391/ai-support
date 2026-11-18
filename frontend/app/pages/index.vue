@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import type { KnowledgeSearchResult } from "~/components/KnowledgeResultList.vue";
 import {
   NDJSON,
   readAnswerStream,
@@ -10,6 +9,7 @@ import {
   INVALID_PLAIN_TEXT_CHARACTER,
   BLANK_PLAIN_TEXT,
   answerStatusMessages,
+  answerStatusTitles,
   asRecord,
   isAnswerIdentity,
   isKnowledgeSearchResult,
@@ -22,6 +22,7 @@ import {
   type AnswerEvidence,
   type AnswerIdentity,
   type AnswerOutput,
+  type KnowledgeSearchResult,
   type Role,
   type TicketDetail,
   type TicketPage,
@@ -131,6 +132,7 @@ const answerOperation = shallowRef<AnswerOperation | null>(null);
 let admittedQuestionDraft: AnswerIdentity | null = null;
 const answerQuestionInput = ref<HTMLTextAreaElement | null>(null);
 const answerWorkspace = ref<HTMLElement | null>(null);
+const knowledgeSearchWorkspace = ref<HTMLElement | null>(null);
 const ticketView = ref<"workbench" | "list" | "detail">("workbench");
 const ticketEditor = shallowRef<TicketEditor | null>(null);
 const ticketDescription = ref("");
@@ -1395,7 +1397,7 @@ async function submitAnswer(retry: AnswerEntry | null = null): Promise<void> {
     }
   }
 
-  // 只在使用者仍留在問答操作區時移動焦點，不從工單或搜尋搶回焦點。
+  // 搜尋雖與問答共用版面，仍排除整個搜尋區，保留輸入、結果及錯誤標題焦點。
   const entries = answerEntries.value;
   await nextTick();
   // prettier-ignore
@@ -1406,6 +1408,7 @@ async function submitAnswer(retry: AnswerEntry | null = null): Promise<void> {
     && !answerOperation.value
     && !ticketEditor.value
     && ticketView.value === "workbench"
+    && !knowledgeSearchWorkspace.value?.contains(document.activeElement)
     && (document.activeElement === document.body || answerWorkspace.value?.contains(document.activeElement))
   ) {
     document.getElementById(focusId)?.focus();
@@ -2134,16 +2137,39 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
+  <header class="app-header">
+    <div class="app-header-inner">
+      <!-- 字印只作品牌識別，避免輔助技術將裝飾重複朗讀。 -->
+      <p class="brand-mark">
+        <span class="brand-seal" aria-hidden="true">臺</span>
+        <span>
+          <span class="brand-title">臺灣知識工作台</span>
+          <span class="brand-subtitle">AI 客服工單與知識查詢</span>
+        </span>
+      </p>
+      <div
+        v-if="isServiceReady && authState === 'signed-in' && identity"
+        class="header-account"
+      >
+        <span>{{ roleTitle }} · {{ identity.username }}</span>
+        <button
+          type="button"
+          class="logout-action"
+          :disabled="isAuthBusy"
+          @click="submitLogout"
+        >
+          {{ isAuthActionBusy ? "登出中…" : "登出" }}
+        </button>
+      </div>
+    </div>
+  </header>
   <main v-if="!isServiceReady" class="setup-shell" aria-labelledby="page-title">
     <header class="page-heading">
-      <p class="eyebrow">AI 客服服務</p>
-      <h1 id="page-title">客服工作台</h1>
+      <h1 id="page-title">本機設定</h1>
       <p>確認本機服務啟用狀態，並依提示完成必要設定。</p>
     </header>
 
     <section class="setup-card" :aria-busy="isLoading">
-      <p class="eyebrow">服務狀態</p>
-
       <div v-if="isLoading" class="status-content" role="status">
         <h2>正在確認服務狀態</h2>
         <p>正在讀取本機服務狀態。</p>
@@ -2250,7 +2276,6 @@ onBeforeUnmount(() => {
       v-else-if="authState === 'signed-out'"
       class="auth-card login-card"
     >
-      <p class="eyebrow">示範帳號登入</p>
       <h1 id="login-title">登入客服工作台</h1>
       <p class="login-intro">
         請使用本機安全提供的示範帳號。此頁不提供註冊或帳號管理。
@@ -2316,19 +2341,8 @@ onBeforeUnmount(() => {
       class="workbench-shell"
       :aria-label="`${roleTitle}工作台`"
     >
-      <aside class="workbench-rail">
-        <div class="rail-brand">
-          <p class="brand-mark">AI 客服</p>
-          <p>本機服務工作區</p>
-        </div>
-
-        <div class="role-context">
-          <p class="rail-label">目前角色</p>
-          <p class="role-badge">{{ roleTitle }}</p>
-        </div>
-
-        <nav class="workbench-nav" aria-label="工作台導覽">
-          <p class="rail-label">工作區</p>
+      <nav class="app-nav" aria-label="工作台導覽">
+        <div class="workbench-nav">
           <button
             type="button"
             class="workbench-nav-action"
@@ -2347,29 +2361,15 @@ onBeforeUnmount(() => {
           >
             {{ ticketListTitle }}
           </button>
-        </nav>
-
-        <div class="rail-account">
-          <p class="rail-label">目前登入</p>
-          <p class="account-name">{{ identity.username }}</p>
-          <button
-            type="button"
-            class="logout-action"
-            :disabled="isAuthBusy"
-            @click="submitLogout"
-          >
-            {{ isAuthActionBusy ? "登出中…" : "登出" }}
-          </button>
         </div>
-      </aside>
+      </nav>
 
       <div class="workbench-main">
-        <header class="workbench-heading">
-          <p class="eyebrow">{{ roleWorkspace }}</p>
-          <h1 ref="workbenchHeading" tabindex="-1">{{ roleTitle }}工作台</h1>
-          <p>
-            目前登入帳號：<strong>{{ identity.username }}</strong
-            >。{{ roleDescription }}
+        <header class="workbench-heading" v-show="ticketView === 'workbench'">
+          <h1 ref="workbenchHeading" tabindex="-1">提出問題</h1>
+          <p class="knowledge-search-help" role="status">
+            本段對話已確認 {{ answerEntries.length }} /
+            {{ MAX_CONVERSATION_QUESTIONS }} 題；重試不增加題數。
           </p>
         </header>
 
@@ -2383,14 +2383,9 @@ onBeforeUnmount(() => {
           class="answer-workspace"
           aria-labelledby="answer-title"
         >
-          <p class="eyebrow">AI 問答</p>
-          <h2 id="answer-title">提出問題</h2>
+          <h2 id="answer-title" class="visually-hidden">問答工作區</h2>
           <p class="knowledge-search-intro">
-            以本機知識文件尋找依據。您可以在本頁追問，或手動重試失敗的問題。請使用虛構、非敏感內容；離開頁面後無法續聊。
-          </p>
-          <p class="knowledge-search-help" role="status">
-            本段對話已確認 {{ answerEntries.length }} /
-            {{ MAX_CONVERSATION_QUESTIONS }} 題；重試不增加題數。
+            以本機知識文件尋找依據。您可以在本頁追問，或手動重試失敗的問題。請勿輸入個人或敏感資訊；離開頁面後無法續聊。
           </p>
 
           <section
@@ -2406,6 +2401,7 @@ onBeforeUnmount(() => {
             </p>
           </section>
 
+          <!-- 每題各自保留問題與來源欄，避免追問時混用前題證據。 -->
           <ol
             v-if="answerEntries.length"
             class="answer-history"
@@ -2414,100 +2410,130 @@ onBeforeUnmount(() => {
             <li
               v-for="(entry, position) in answerEntries"
               :key="entry.output.question_id"
-              class="knowledge-search-state"
+              class="answer-entry"
             >
-              <h3>第 {{ position + 1 }} 題</h3>
-              <p class="answer-text">{{ entry.question }}</p>
-              <p v-if="entry.output.status === 'running'" role="status">
-                {{
-                  answerOperation?.retry?.output.question_id ===
-                  entry.output.question_id
-                    ? "正在重試這一題，請稍候。"
-                    : "正在查詢知識文件並處理這一題，請稍候。"
-                }}
-              </p>
-              <template v-else-if="entry.output.status === 'answered'">
-                <h4 :id="`answer-result-${position}`" tabindex="-1">回答</h4>
-                <p class="knowledge-search-help">
-                  模型 <code>{{ SETUP_MODEL }}</code>
+              <div class="answer-transcript">
+                <h3 :id="`question-${position}`">第 {{ position + 1 }} 題</h3>
+                <p class="answer-text">{{ entry.question }}</p>
+                <p v-if="entry.output.status === 'running'" role="status">
+                  {{
+                    answerOperation?.retry?.output.question_id ===
+                    entry.output.question_id
+                      ? "正在重試這一題，請稍候。"
+                      : "正在查詢知識文件並處理這一題，請稍候。"
+                  }}
                 </p>
-                <p class="answer-text">{{ entry.output.answer }}</p>
-                <h5>引用來源</h5>
-                <KnowledgeResultList :results="entry.output.citations" />
-              </template>
-              <template v-else>
-                <div class="knowledge-search-feedback">
-                  <h4 :id="`answer-result-${position}`" tabindex="-1">
-                    {{
-                      entry.output.status === "stopped"
-                        ? "回答未完成"
-                        : answerOperation?.retry === entry
-                          ? "上次問答未完成"
-                          : "問答未完成"
-                    }}
-                  </h4>
-                  <p v-if="entry.output.status === 'unconfirmed'">
-                    伺服器已受理，但目前無法確認回答結果。可從這一題建立工單，取得已保存的證據。
+                <template v-else-if="entry.output.status === 'answered'">
+                  <h4 :id="`answer-result-${position}`" tabindex="-1">回答</h4>
+                  <p class="knowledge-search-help">
+                    模型 <code>{{ SETUP_MODEL }}</code>
                   </p>
-                  <p v-else-if="entry.output.status === 'stopped'">
-                    這次問答已停止等待，可查看建單時保存的搜尋結果。
-                  </p>
-                  <p v-else>
-                    {{ answerStatusMessages[entry.output.status] }}
-                  </p>
-                  <p
-                    v-if="entry.notice && answerOperation?.retry !== entry"
-                    :id="`answer-retry-notice-${position}`"
-                    role="alert"
-                    tabindex="-1"
+                  <AnswerText :text="entry.output.answer ?? ''" />
+                </template>
+                <template v-else>
+                  <!-- 資料不足保留搜尋與建單入口，以標題及色面區別技術失敗。 -->
+                  <div
+                    class="knowledge-search-feedback"
+                    :class="{
+                      'is-insufficient':
+                        entry.output.status === 'insufficient_evidence',
+                    }"
                   >
-                    {{ entry.notice.message }}
+                    <h4 :id="`answer-result-${position}`" tabindex="-1">
+                      {{ answerStatusTitles[entry.output.status] }}
+                    </h4>
+                    <p v-if="entry.output.status === 'unconfirmed'">
+                      伺服器已受理，但目前無法確認回答結果。可從這一題建立工單，取得已保存的證據。
+                    </p>
+                    <p v-else-if="entry.output.status === 'stopped'">
+                      這次問答已停止等待，可查看建單時保存的搜尋結果。
+                    </p>
+                    <p v-else>
+                      {{ answerStatusMessages[entry.output.status] }}
+                    </p>
+                    <p
+                      v-if="entry.notice && answerOperation?.retry !== entry"
+                      :id="`answer-retry-notice-${position}`"
+                      role="alert"
+                      tabindex="-1"
+                    >
+                      {{ entry.notice.message }}
+                    </p>
+                  </div>
+                  <p v-if="answerOperation?.retry === entry" role="status">
+                    正在重試這一題，請稍候。
                   </p>
-                </div>
-                <template v-if="entry.output.status !== 'unconfirmed'">
-                  <h5>本次已取得的搜尋結果</h5>
+                  <button
+                    v-if="
+                      !isAnswerConversationBlocked &&
+                      entry.notice?.block !== 'retry' &&
+                      entry.output.status !== 'unconfirmed'
+                    "
+                    type="button"
+                    class="answer-secondary-action"
+                    :aria-label="`重試這一題（第 ${position + 1} 題）`"
+                    :disabled="
+                      answerOperation !== null || ticketEditor !== null
+                    "
+                    @click="submitAnswer(entry)"
+                  >
+                    重試這一題
+                  </button>
+                </template>
+                <button
+                  :id="`create-ticket-${entry.output.question_id}`"
+                  type="button"
+                  class="answer-secondary-action"
+                  :aria-label="`建立工單（第 ${position + 1} 題）`"
+                  :disabled="
+                    ticketEditor !== null || answerOperation?.retry === entry
+                  "
+                  @click="openTicketEditor(entry)"
+                >
+                  建立工單
+                </button>
+              </div>
+              <aside
+                class="answer-evidence"
+                :aria-labelledby="`evidence-${position} question-${position}`"
+              >
+                <h4 :id="`evidence-${position}`">
+                  第 {{ position + 1 }} 題 ·
+                  {{
+                    entry.output.status === "answered" ? "引用來源" : "搜尋依據"
+                  }}
+                </h4>
+                <KnowledgeResultList
+                  v-if="entry.output.status === 'answered'"
+                  :results="entry.output.citations"
+                />
+                <template
+                  v-else-if="
+                    entry.output.status !== 'running' &&
+                    entry.output.status !== 'unconfirmed'
+                  "
+                >
+                  <p class="knowledge-search-help">本次已取得的搜尋結果</p>
                   <KnowledgeResultList
                     v-if="entry.output.search_results.length"
                     :results="entry.output.search_results"
                   />
                   <p v-else>本次問答沒有取得符合的知識片段。</p>
                 </template>
-                <p v-if="answerOperation?.retry === entry" role="status">
-                  正在重試這一題，請稍候。
+                <p v-else class="knowledge-search-help">
+                  {{
+                    entry.output.status === "running"
+                      ? "回答完成後會顯示這一題的依據。"
+                      : "可從這一題建立工單，取得已保存的證據。"
+                  }}
                 </p>
-                <button
-                  v-if="
-                    !isAnswerConversationBlocked &&
-                    entry.notice?.block !== 'retry' &&
-                    entry.output.status !== 'unconfirmed'
-                  "
-                  type="button"
-                  class="answer-secondary-action"
-                  :aria-label="`重試這一題（第 ${position + 1} 題）`"
-                  :disabled="answerOperation !== null || ticketEditor !== null"
-                  @click="submitAnswer(entry)"
-                >
-                  重試這一題
-                </button>
-              </template>
-              <button
-                :id="`create-ticket-${entry.output.question_id}`"
-                type="button"
-                class="answer-secondary-action"
-                :aria-label="`建立工單（第 ${position + 1} 題）`"
-                :disabled="
-                  ticketEditor !== null || answerOperation?.retry === entry
-                "
-                @click="openTicketEditor(entry)"
-              >
-                建立工單
-              </button>
+              </aside>
             </li>
           </ol>
 
           <section
             v-if="ticketEditor"
-            class="knowledge-search-state"
+            class="ticket-editor"
             aria-labelledby="ticket-editor-title"
           >
             <h3 id="ticket-editor-title">建立工單</h3>
@@ -2585,69 +2611,177 @@ onBeforeUnmount(() => {
             </form>
           </section>
 
-          <form
-            class="login-form answer-form"
-            aria-labelledby="answer-title"
-            :aria-busy="answerOperation !== null"
-            novalidate
-            @submit.prevent="submitAnswer()"
-          >
-            <div class="field-group">
-              <label for="answer-question">您的問題</label>
-              <textarea
-                id="answer-question"
-                ref="answerQuestionInput"
-                v-model="answerQuestion"
-                name="question"
-                rows="4"
-                required
-                autocomplete="off"
-                :readonly="
-                  answerOperation !== null && answerOperation.retry === null
+          <div class="answer-tools">
+            <form
+              class="login-form answer-form answer-composer"
+              aria-labelledby="answer-title"
+              :aria-busy="answerOperation !== null"
+              novalidate
+              @submit.prevent="submitAnswer()"
+            >
+              <div class="field-group">
+                <label for="answer-question">{{
+                  answerEntries.length ? "追問" : "您的問題"
+                }}</label>
+                <textarea
+                  id="answer-question"
+                  ref="answerQuestionInput"
+                  v-model="answerQuestion"
+                  name="question"
+                  rows="3"
+                  required
+                  autocomplete="off"
+                  :readonly="
+                    answerOperation !== null && answerOperation.retry === null
+                  "
+                  :aria-invalid="answerQuestionError ? 'true' : undefined"
+                  :aria-describedby="
+                    answerQuestionError
+                      ? 'answer-question-help answer-question-error'
+                      : 'answer-question-help'
+                  "
+                  @input="handleAnswerQuestionInput"
+                ></textarea>
+                <p id="answer-question-help" class="knowledge-search-help">
+                  最多 2,000 個 Unicode 字元。
+                </p>
+                <p
+                  v-if="answerQuestionError"
+                  id="answer-question-error"
+                  class="form-feedback"
+                  role="alert"
+                >
+                  {{ answerQuestionError }}
+                </p>
+              </div>
+              <button
+                type="submit"
+                class="primary-action"
+                :disabled="
+                  answerOperation !== null ||
+                  ticketEditor !== null ||
+                  isAnswerAtLimit ||
+                  isAnswerConversationBlocked
                 "
-                :aria-invalid="answerQuestionError ? 'true' : undefined"
-                :aria-describedby="
-                  answerQuestionError
-                    ? 'answer-question-help answer-question-error'
-                    : 'answer-question-help'
-                "
-                @input="handleAnswerQuestionInput"
-              ></textarea>
-              <p id="answer-question-help" class="knowledge-search-help">
-                最多 2,000 個 Unicode 字元。
+              >
+                {{ answerEntries.length ? "送出追問" : "提出問題" }}
+              </button>
+              <button
+                v-if="answerEntries.length || isAnswerConversationBlocked"
+                type="button"
+                class="answer-secondary-action"
+                :disabled="answerOperation !== null || ticketEditor !== null"
+                @click="startNewConversation"
+              >
+                開始新的對話
+              </button>
+            </form>
+
+            <section
+              v-show="ticketView === 'workbench'"
+              ref="knowledgeSearchWorkspace"
+              class="knowledge-search"
+              aria-labelledby="knowledge-search-title"
+            >
+              <h2 id="knowledge-search-title">搜尋知識文件</h2>
+              <p class="knowledge-search-intro">
+                搜尋已匯入的真實文件片段，顯示原文件摘錄。
               </p>
-              <p
-                v-if="answerQuestionError"
-                id="answer-question-error"
-                class="form-feedback"
+
+              <form
+                class="knowledge-search-form login-form"
+                :aria-busy="knowledgeSearchState === 'loading'"
+                @submit.prevent="submitKnowledgeSearch"
+              >
+                <div class="field-group">
+                  <label for="knowledge-query">搜尋關鍵字</label>
+                  <input
+                    id="knowledge-query"
+                    ref="knowledgeQueryInput"
+                    v-model="knowledgeQuery"
+                    name="query"
+                    type="search"
+                    required
+                    :aria-invalid="knowledgeQueryError ? 'true' : undefined"
+                    :aria-describedby="
+                      knowledgeQueryError
+                        ? 'knowledge-query-help knowledge-query-error'
+                        : 'knowledge-query-help'
+                    "
+                    @input="handleKnowledgeQueryInput"
+                  />
+                  <p id="knowledge-query-help" class="knowledge-search-help">
+                    最多 2,000 個 Unicode
+                    字元。支援中文關鍵詞與自然問句，臺／台與全形字會正規化。
+                  </p>
+                  <p
+                    v-if="knowledgeQueryError"
+                    id="knowledge-query-error"
+                    class="form-feedback"
+                    role="alert"
+                  >
+                    {{ knowledgeQueryError }}
+                  </p>
+                </div>
+                <button
+                  type="submit"
+                  class="primary-action"
+                  :disabled="knowledgeSearchState === 'loading'"
+                >
+                  {{
+                    knowledgeSearchState === "loading"
+                      ? "搜尋中…"
+                      : knowledgeSearchState === "error"
+                        ? "重試搜尋"
+                        : "搜尋知識"
+                  }}
+                </button>
+              </form>
+
+              <div
+                v-if="knowledgeSearchState === 'loading'"
+                class="knowledge-search-state"
+                role="status"
+              >
+                <h3>正在搜尋知識</h3>
+                <p>正在查詢本機知識文件，請稍候。</p>
+              </div>
+
+              <section
+                v-else-if="knowledgeSearchState === 'error'"
+                class="knowledge-search-feedback"
                 role="alert"
               >
-                {{ answerQuestionError }}
-              </p>
-            </div>
-            <button
-              type="submit"
-              class="primary-action"
-              :disabled="
-                answerOperation !== null ||
-                ticketEditor !== null ||
-                isAnswerAtLimit ||
-                isAnswerConversationBlocked
-              "
-            >
-              {{ answerEntries.length ? "追問" : "提出問題" }}
-            </button>
-            <button
-              v-if="answerEntries.length || isAnswerConversationBlocked"
-              type="button"
-              class="answer-secondary-action"
-              :disabled="answerOperation !== null || ticketEditor !== null"
-              @click="startNewConversation"
-            >
-              開始新的對話
-            </button>
-          </form>
+                <h3 ref="knowledgeSearchErrorHeading" tabindex="-1">
+                  搜尋未完成
+                </h3>
+                <p>{{ knowledgeSearchError }}</p>
+              </section>
 
+              <section
+                v-else-if="['empty', 'success'].includes(knowledgeSearchState)"
+                class="knowledge-results"
+                aria-labelledby="knowledge-results-title"
+              >
+                <h3
+                  id="knowledge-results-title"
+                  ref="knowledgeResultsHeading"
+                  tabindex="-1"
+                >
+                  搜尋結果
+                </h3>
+                <p v-if="knowledgeSearchState === 'empty'" role="status">
+                  查無「{{ knowledgeQuery }}」的符合片段，可修改關鍵字後重試。
+                </p>
+                <template v-else>
+                  <p role="status">
+                    找到 {{ knowledgeResults.length }} 筆知識片段。
+                  </p>
+                  <KnowledgeResultList :results="knowledgeResults" />
+                </template>
+              </section>
+            </section>
+          </div>
           <p
             v-if="
               answerOperation &&
@@ -2664,116 +2798,13 @@ onBeforeUnmount(() => {
         </section>
 
         <section
-          v-show="ticketView === 'workbench'"
-          class="knowledge-search"
-          aria-labelledby="knowledge-search-title"
-        >
-          <p class="eyebrow">知識文件</p>
-          <h2 id="knowledge-search-title">搜尋知識文件</h2>
-          <p class="knowledge-search-intro">
-            搜尋已匯入的真實文件片段，顯示原文件摘錄。
-          </p>
-
-          <form
-            class="knowledge-search-form login-form"
-            :aria-busy="knowledgeSearchState === 'loading'"
-            @submit.prevent="submitKnowledgeSearch"
-          >
-            <div class="field-group">
-              <label for="knowledge-query">搜尋關鍵字</label>
-              <input
-                id="knowledge-query"
-                ref="knowledgeQueryInput"
-                v-model="knowledgeQuery"
-                name="query"
-                type="search"
-                required
-                :aria-invalid="knowledgeQueryError ? 'true' : undefined"
-                :aria-describedby="
-                  knowledgeQueryError
-                    ? 'knowledge-query-help knowledge-query-error'
-                    : 'knowledge-query-help'
-                "
-                @input="handleKnowledgeQueryInput"
-              />
-              <p id="knowledge-query-help" class="knowledge-search-help">
-                最多 2,000 個 Unicode 字元。中文採字面子字串搜尋。
-              </p>
-              <p
-                v-if="knowledgeQueryError"
-                id="knowledge-query-error"
-                class="form-feedback"
-                role="alert"
-              >
-                {{ knowledgeQueryError }}
-              </p>
-            </div>
-            <button
-              type="submit"
-              class="primary-action"
-              :disabled="knowledgeSearchState === 'loading'"
-            >
-              {{
-                knowledgeSearchState === "loading"
-                  ? "搜尋中…"
-                  : knowledgeSearchState === "error"
-                    ? "重試搜尋"
-                    : "搜尋知識"
-              }}
-            </button>
-          </form>
-
-          <div
-            v-if="knowledgeSearchState === 'loading'"
-            class="knowledge-search-state"
-            role="status"
-          >
-            <h3>正在搜尋知識</h3>
-            <p>正在查詢本機知識文件，請稍候。</p>
-          </div>
-
-          <section
-            v-else-if="knowledgeSearchState === 'error'"
-            class="knowledge-search-feedback"
-            role="alert"
-          >
-            <h3 ref="knowledgeSearchErrorHeading" tabindex="-1">搜尋未完成</h3>
-            <p>{{ knowledgeSearchError }}</p>
-          </section>
-
-          <section
-            v-else-if="['empty', 'success'].includes(knowledgeSearchState)"
-            class="knowledge-results"
-            aria-labelledby="knowledge-results-title"
-          >
-            <h3
-              id="knowledge-results-title"
-              ref="knowledgeResultsHeading"
-              tabindex="-1"
-            >
-              搜尋結果
-            </h3>
-            <p v-if="knowledgeSearchState === 'empty'" role="status">
-              查無「{{ knowledgeQuery }}」的符合片段，可修改關鍵字後重試。
-            </p>
-            <template v-else>
-              <p role="status">
-                找到 {{ knowledgeResults.length }} 筆知識片段。
-              </p>
-              <KnowledgeResultList :results="knowledgeResults" />
-            </template>
-          </section>
-        </section>
-
-        <section
           v-if="ticketView !== 'workbench'"
           class="ticket-workspace"
           aria-labelledby="ticket-title"
         >
-          <p class="eyebrow">工單</p>
-          <h2 id="ticket-title" ref="ticketHeading" tabindex="-1">
+          <h1 id="ticket-title" ref="ticketHeading" tabindex="-1">
             {{ ticketView === "list" ? ticketListTitle : "工單詳情" }}
-          </h2>
+          </h1>
           <button
             v-if="ticketView === 'detail'"
             type="button"
@@ -2820,61 +2851,47 @@ onBeforeUnmount(() => {
               <li
                 v-for="ticket in ticketPage.tickets"
                 :key="ticket.id"
-                class="knowledge-search-state"
+                class="ticket-list-row"
               >
-                <p class="ticket-summary-text answer-text">
-                  {{ ticket.description }}
-                </p>
-                <dl class="knowledge-result-details">
-                  <div>
-                    <dt>工單編號</dt>
-                    <dd>
-                      <code>{{ ticket.id }}</code>
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>工單狀態</dt>
-                    <dd>
-                      {{ ticket.status === "closed" ? "已結案" : "開啟" }}
-                    </dd>
-                  </div>
-                  <div v-if="ticket.closed_at">
-                    <dt>結案時間</dt>
-                    <dd>
-                      <time :datetime="ticket.closed_at">{{
-                        ticketTime(ticket.closed_at)
-                      }}</time>
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>原始問題</dt>
-                    <dd class="ticket-summary-preview answer-text">
-                      {{ ticket.question.trimStart() }}
-                    </dd>
-                  </div>
-                  <div v-if="ticket.status === 'closed'">
-                    <dt>處理結果</dt>
-                    <dd class="ticket-summary-preview answer-text">
-                      {{ ticket.resolution?.trimStart() }}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>建立時間</dt>
-                    <dd>
-                      <time :datetime="ticket.created_at">{{
-                        ticketTime(ticket.created_at)
-                      }}</time>
-                    </dd>
-                  </div>
-                </dl>
-                <button
-                  type="button"
-                  class="answer-secondary-action"
-                  :aria-label="`查看工單 ${ticket.id}`"
-                  @click="loadTickets(ticket.id)"
+                <div class="ticket-summary">
+                  <button
+                    type="button"
+                    class="ticket-summary-link"
+                    :aria-label="`查看工單：${ticket.description}（${ticket.id}）`"
+                    @click="loadTickets(ticket.id)"
+                  >
+                    <span class="ticket-summary-text answer-text">{{
+                      ticket.description
+                    }}</span>
+                  </button>
+                  <p class="ticket-summary-preview answer-text">
+                    <span class="visually-hidden">原始問題：</span
+                    >{{ ticket.question.trimStart() }}
+                  </p>
+                  <p
+                    class="ticket-summary-preview answer-text"
+                    v-if="ticket.status === 'closed'"
+                  >
+                    <span>處理結果：</span>{{ ticket.resolution?.trimStart() }}
+                  </p>
+                  <code>{{ ticket.id }}</code>
+                </div>
+                <div class="ticket-times">
+                  <time :datetime="ticket.created_at"
+                    ><span class="visually-hidden">建立時間：</span
+                    >{{ ticketTime(ticket.created_at) }}</time
+                  >
+                  <p v-if="ticket.closed_at">
+                    結案時間：<time :datetime="ticket.closed_at">{{
+                      ticketTime(ticket.closed_at)
+                    }}</time>
+                  </p>
+                </div>
+                <span
+                  class="ticket-status"
+                  :class="{ 'is-closed': ticket.status === 'closed' }"
+                  >{{ ticket.status === "closed" ? "已結案" : "開啟" }}</span
                 >
-                  查看工單
-                </button>
               </li>
             </ul>
             <nav
@@ -2998,6 +3015,8 @@ onBeforeUnmount(() => {
         </section>
 
         <p class="workbench-note">
+          {{ roleWorkspace }} ·
+          {{ roleDescription }}
           登入狀態由本機服務管理；重新載入頁面時會重新確認目前角色。
         </p>
       </div>

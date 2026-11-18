@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
-from backend import sessions
+from backend import knowledge_search, sessions
 from backend.activation import setup_status
 from backend.database import Settings
 
@@ -197,8 +197,7 @@ def find_fragments(
 def find_evidence(
     conn: Connection[tuple[object, ...]], query: str
 ) -> list[SearchEvidence]:
-    # 以單一 SELECT 取得完整舊批或新批。C collation 只折疊 ASCII 大小寫，
-    # strpos 不把百分號或底線當成樣式；依穩定來源識別排序後取有界結果。
+    # 以單一 SELECT 取得完整舊批或新批，再對有限本機語料排名；不先截掉相關來源。
     with conn.cursor(row_factory=dict_row) as cursor:
         cursor.execute(
             """
@@ -206,15 +205,15 @@ def find_evidence(
                    f.id AS fragment_id, f.text AS excerpt, f.permissions
             FROM knowledge_documents AS d
             CROSS JOIN LATERAL jsonb_to_recordset(d.fragments) AS f(id text, text text, permissions jsonb)
-            CROSS JOIN (SELECT lower(%s::text COLLATE "C") AS term) AS q
-            WHERE strpos(lower(d.title COLLATE "C"), q.term) > 0
-               OR strpos(lower(f.text COLLATE "C"), q.term) > 0
             ORDER BY d.id COLLATE "C", f.id COLLATE "C"
-            LIMIT %s
             """,
-            (query, RESULT_LIMIT),
         )
         rows = cursor.fetchall()
+
+    # 手動搜尋與模型工具共用相同排名，最後才限制公開結果數量。
+    ranked = knowledge_search.rank(
+        query, [(row["title"], row["excerpt"]) for row in rows]
+    )
 
     # 保留可序列化的公開來源與不外傳的權限事實，舊文件缺欄時視為未列明。
     return [
@@ -225,5 +224,6 @@ def find_evidence(
                 for permission in (row["permissions"] or [])
             ),
         )
-        for row in rows
+        for index in ranked[:RESULT_LIMIT]
+        for row in [rows[index]]
     ]

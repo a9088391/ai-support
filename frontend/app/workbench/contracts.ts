@@ -1,5 +1,3 @@
-import type { KnowledgeSearchResult } from "../components/KnowledgeResultList.vue";
-
 export const SETUP_MODEL = "gemini-3.5-flash-lite" as const;
 export const INVALID_PLAIN_TEXT_CHARACTER =
   /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\ud800-\udfff]/u;
@@ -8,11 +6,21 @@ const MAX_ANSWER_SOURCES = 40;
 const MAX_TICKET_TEXT_CODE_POINTS = 4_000;
 const RESOURCE_ID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 
+// 搜尋、問答及工單共用來源DTO；契約層不依賴呈現元件。
+export interface KnowledgeSearchResult {
+  readonly document_id: string;
+  readonly title: string;
+  readonly version: string;
+  readonly fragment_id: string;
+  readonly excerpt: string;
+}
+
 export type Role = "user" | "support";
 
 export const answerStatusMessages = {
   answered: "",
-  insufficient_evidence: "本次搜尋沒有足夠依據回答這個問題。",
+  insufficient_evidence:
+    "本次搜尋沒有足夠的知識資料可回答，請查看已取得的搜尋依據，或由客服協助補充資料。",
   invalid_output: "本次回答未通過驗證。您可以查看已取得的搜尋結果。",
   rate_limited: "模型請求已達額度或速率上限，請稍後再手動重試。",
   timed_out: "本次問答已逾時。您可以查看已取得的搜尋結果。",
@@ -21,6 +29,18 @@ export const answerStatusMessages = {
 } as const;
 
 type AnswerStatus = keyof typeof answerStatusMessages;
+
+// 工作台與工單快照共用標題；待確認僅供前端呈現，不加入後端終態契約。
+export const answerStatusTitles = {
+  answered: "回答",
+  insufficient_evidence: "知識資料不足",
+  invalid_output: "模型回答未通過驗證",
+  rate_limited: "模型額度或速率已達上限",
+  timed_out: "問答已逾時",
+  unavailable: "模型服務暫時無法使用",
+  stopped: "回答未完成",
+  unconfirmed: "回答結果待確認",
+} as const satisfies Record<AnswerStatus | "unconfirmed", string>;
 
 export interface AnswerIdentity {
   readonly conversation_id: string;
